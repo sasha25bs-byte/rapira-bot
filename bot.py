@@ -23,8 +23,8 @@ Telegram-бот с симулятором кейсов для Rapira Online.
 ### 4. Настрой config.py
 Открой файл config.py и вставь:
 ```python
-BOT_TOKEN = "123456:ABC-DEF..."   # токен от BotFather
-ADMIN_IDS = [123456789]           # твой Telegram ID
+BOT_TOKEN = "8869744762:AAF8jJ_jZVlpOHHW-BJzXfozPczSTEiaZZA"   # токен от BotFather
+ADMIN_IDS = [5839642306]           # твой Telegram ID
 ```
 
 ### 5. Установи библиотеки
