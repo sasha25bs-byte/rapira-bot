@@ -1,81 +1,29 @@
-# 🎮 Rapira Case Bot
+import asyncio
+import logging
+from aiogram import Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.fsm.storage.memory import MemoryStorage
 
-Telegram-бот с симулятором кейсов для Rapira Online.
+from config import BOT_TOKEN
+import database as db
+from handlers import start, cases, admin, payment
 
----
+logging.basicConfig(level=logging.INFO)
 
-## ⚡ Быстрый старт
+async def main():
+    bot = Bot(
+        token=BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+    )
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(start.router)
+    dp.include_router(cases.router)
+    dp.include_router(admin.router)
+    dp.include_router(payment.router)
+    await db.init_db()
+    print("✅ Бот запущен!")
+    await dp.start_polling(bot)
 
-### 1. Установи Python
-Скачай Python 3.11+ с сайта https://python.org
-При установке поставь галочку "Add to PATH"!
-
-### 2. Создай бота в Telegram
-- Открой @BotFather в Telegram
-- Напиши /newbot
-- Придумай имя и username (например @RapiraCaseBot)
-- Скопируй полученный TOKEN
-
-### 3. Узнай свой Telegram ID
-- Открой @userinfobot
-- Он напишет твой ID (числа, например 123456789)
-
-### 4. Настрой config.py
-Открой файл config.py и вставь:
-```python
-BOT_TOKEN = "8869744762:AAF8jJ_jZVlpOHHW-BJzXfozPczSTEiaZZA"   # токен от BotFather
-ADMIN_IDS = [5839642306]           # твой Telegram ID
-```
-
-### 5. Установи библиотеки
-Открой папку rapira_bot, зажми Shift + правая кнопка мыши → "Открыть PowerShell"
-Введи команду:
-```
-pip install -r requirements.txt
-```
-
-### 6. Запусти бота
-```
-python bot.py
-```
-
-Всё! Бот работает. Напиши ему /start в Telegram.
-
----
-
-## 📋 Команды бота
-
-### Для игроков:
-| Команда | Описание |
-|---------|----------|
-| /start | Главное меню |
-| /balance | Текущий баланс |
-
-### Для администратора:
-| Команда | Описание |
-|---------|----------|
-| /pending | Просмотр заявок на проверку |
-
-Заявки со скриншотами приходят прямо тебе в Telegram — нажимаешь кнопку сколько монет начислить.
-
----
-
-## 💰 Как работает монетизация
-
-**Вариант 1 — Скриншоты:**
-Игрок покупает в Rapira → скриншот → ты проверяешь → начисляешь монеты вручную
-
-**Вариант 3 — Telegram Stars:**
-Игрок покупает Stars прямо в боте → монеты начисляются автоматически
-
----
-
-## 🚀 Деплой на сервер (Railway)
-
-1. Зарегистрируйся на railway.app
-2. Создай новый проект → Deploy from GitHub
-3. Загрузи папку rapira_bot
-4. В Variables добавь: BOT_TOKEN = твой токен
-5. Deploy!
-
-Бот будет работать 24/7 бесплатно.
+if __name__ == "__main__":
+    asyncio.run(main())
