@@ -512,7 +512,6 @@ class SS(StatesGroup):
 def mmk():
     b = InlineKeyboardBuilder()
     b.button(text="📦 Кейсы",          callback_data="menu_cases")
-    b.button(text="🎯 Задание",         callback_data="menu_submit")
     b.button(text="💳 Купить монеты",   callback_data="menu_buy_coins")
     b.button(text="🎒 Инвентарь",       callback_data="menu_inventory")
     b.button(text="🏆 Топ игроков",     callback_data="menu_top")
