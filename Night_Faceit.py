@@ -28,11 +28,11 @@ from telegram.constants import ParseMode
 
 import os as _os
 
-BOT_TOKEN = "ВСТАВЬ_ТОКЕН_СЮДА"  # ← сюда вставь свой токен от @BotFather
+BOT_TOKEN = "8771277676:AAER0fIck_J_YBAzW4Or9vtrFI7We6rQICk"  # ← сюда вставь свой токен от @BotFather
 
 # ── РОЛИ ──────────────────────────────────────────
 # Создатель — доступ ко всем командам
-CREATOR_ID       = 5839642306
+CREATOR_ID       = 7979653269
 # Админы — бан, мут, выдача эло за катки, создание матчей
 ADMIN_IDS        = [CREATOR_ID]
 # Модераторы — только мут и выдача каток (/win)
@@ -56,15 +56,15 @@ ANTHROPIC_MODEL    = "claude-sonnet-4-6"
 #  • PROFANITY_WORDS — нецензурная лексика / мат (не всегда направлен на человека)
 INSULT_WORDS = [
     "пидор", "пидар", "пидрила", "пидорас", "пидараст",
-    "хуеплет", "хуесос", "еблан", "мудак", "мудила",
-    "шлюха", "шалава", "давалка", "блядь",
-    "ублюдок", "мразь", "тварь", "чмо", "залупа",
+    "хуеплет", "хуесос", "еблан",
+    "шлюха", "шалава", "давалка", 
+    "ублюдок", "тварь", "чмо"
 ]
 
 PROFANITY_WORDS = [
-    "нахуй", "нахер", "твою мать", "твою маму",
-    "маму твою", "маму ебал", "мать ебал",
-    "ёб твою", "еб твою", "пошел нахуй", "иди нахуй",
+    "нахуй", "нахер", "твою мать ебал", "твою маму ебал",
+    "маму твою ебал", "маму ебал", "мать ебал",
+  "пошел нахуй", "иди нахуй", "сын шлюхи", "сынок шалавы" , "отец твой хуеплет"
 ]
 
 
@@ -84,7 +84,7 @@ PICK_TIMEOUT   = 90
 BAN_TIMEOUT    = 90
 
 ELO_WIN_PC       = 15
-ELO_LOSS_PC      = 25
+ELO_LOSS_PC      = 30
 ELO_WIN_MOBILE   = 25
 ELO_LOSS_MOBILE  = 20
 ELO_MIN      = 100
@@ -102,8 +102,8 @@ NOT_REGISTERED_MSG = (
     "Для регистрации введите:\n"
     "<code>/reg GAME_ID Никнейм Платформа</code>\n\n"
     "Примеры:\n"
-    "<code>/reg 33333 ProPlayer pc</code>\n"
-    "<code>/reg 33333 ProPlayer mobile</code>\n\n"
+    "<code>/reg 6888 Londyyy pc</code>\n"
+    "<code>/reg 6888 Londyyy mobile</code>\n\n"
     "⚠️ <b>За обман платформы вы получаете бан от администрации Faceit!</b>"
 )
 
@@ -879,8 +879,8 @@ async def reg_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "<code>/reg GAME_ID Никнейм Платформа</code>\n\n"
             "🖥 Платформы: <code>pc</code> или <code>mobile</code>\n\n"
             "Примеры:\n"
-            "<code>/reg 33333 ProPlayer pc</code>\n"
-            "<code>/reg 33333 ProPlayer mobile</code>\n\n"
+            "<code>/reg 6888 Londyyy pc</code>\n"
+            "<code>/reg 6888 Londyyy mobile</code>\n\n"
             "⚠️ <b>За обман платформы вы получаете бан от администрации Faceit!</b>",
             parse_mode=ParseMode.HTML
         )
@@ -905,7 +905,7 @@ async def reg_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not game_id.isdigit():
         await update.message.reply_text(
             "🚫 <b>GAME ID должен содержать только цифры!</b>\n\n"
-            "Пример: <code>/reg 33333 ProPlayer pc</code>",
+            "Пример: <code>/reg 6888 Londyyy pc</code>",
             parse_mode=ParseMode.HTML
         )
         return
@@ -1240,7 +1240,7 @@ async def play2_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "❌ <b>Лобби создаётся только в беседе!</b>\n\n"
             "Заходи в беседу и запускай там:\n"
-            "👉 https://t.me/+_tJYrsFI5jFhZTRi",
+            "👉 https://t.me/faceitggvp",
             parse_mode=ParseMode.HTML
         )
         return
@@ -1322,13 +1322,13 @@ RULES_TEXT = (
     "<b>👤 РЕГИСТРАЦИЯ</b>\n"
     "Без регистрации — в матч не попасть.\n"
     "Команда: /reg GAME_ID Никнейм Платформа\n"
-    "├ ПК: /reg 33333 ProPlayer pc\n"
-    "└ Моб: /reg 33333 ProPlayer mobile\n"
+    "├ ПК: /reg 6888 Londyyy pc\n"
+    "└ Моб: /reg 6888 Londyyy mobile\n"
     "⚠️ Чужой ID или неверная платформа — <b>бан</b>.\n\n"
     "━━━━━━━━━━━━━━━━━━━━━━\n\n"
     "<b>📊 ЭЛО И УРОВНИ</b>\n"
     "Старт: 1000 ЭЛО | Минимум: 100 ЭЛО\n\n"
-    "💻 ПК — победа <b>+15</b> / поражение <b>−25</b>\n"
+    "💻 ПК — победа <b>+15</b> / поражение <b>−30</b>\n"
     "📱 Мобайл — победа <b>+25</b> / поражение <b>−20</b>\n\n"
     "⚪ LVL 1 → до 500\n"
     "🟢 LVL 2 → 501 – 750\n"
@@ -1355,7 +1355,7 @@ RULES_TEXT = (
     "└ Политика и разжигание конфликтов\n\n"
     "━━━━━━━━━━━━━━━━━━━━━━\n\n"
     "<b>🎮 ПРАВИЛА МАТЧЕЙ</b>\n"
-    "├ Лив из матча = поражение команде + наказание\n"
+    "├ Лив из матча = наказание в виде бана\n"
     "├ Код лобби — сразу в чат после создания\n"
     "├ Результат — скрин в тему «Результаты игр» с номером матча\n"
     "└ Без скрина ЭЛО не начисляется\n\n"
@@ -1370,9 +1370,9 @@ RULES_TEXT = (
     "Жалоба на читера — в личку админу с доказательствами.\n\n"
     "━━━━━━━━━━━━━━━━━━━━━━\n\n"
     "<b>👑 АДМИНИСТРАЦИЯ</b>\n"
-    "👑 Создатель — полный доступ\n"
-    "🛡 Админ — мут, бан, ЭЛО, матчи\n"
-    "🔰 Модератор — мут / размут / победы\n\n"
+    "👑 Создатель\n"
+    "🛡 Админ\n"
+    "🔰 Модератор\n\n"
     "Споры с администрацией в общем чате — запрещены.\n"
     "Все вопросы — в личку.\n\n"
     "━━━━━━━━━━━━━━━━━━━━━━\n"
