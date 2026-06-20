@@ -847,11 +847,11 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🎮 <b>Лобби</b> создаётся <b>только в беседе</b> — в ЛС не работает!\n\n"
         f"<b>Команды:</b>\n"
         f"/reg — Регистрация\n"
-        f"/play5 — Лобби 5v5\n"
-        f"/play2 — Лобби 2v2\n"
+        f"/play5v5 — Лобби 5v5\n"
+        f"/play2v2 — Лобби 2v2\n"
         f"/stats — Твоя статистика\n"
         f"/top — Топ игроков\n"
-        f"/admins — Список команд по ролям"
+        f"/admins — Список Администрации"
     )
     await update.message.reply_text(
         text,
@@ -917,7 +917,7 @@ async def reg_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not nickname:
         await update.message.reply_text(
             "🚫 Не указан никнейм!\n\n"
-            "Пример: <code>/reg 33333 ProPlayer pc</code>",
+            "Пример: <code>/reg 6888 Londyyy pc</code>",
             parse_mode=ParseMode.HTML
         )
         return
@@ -941,7 +941,7 @@ async def reg_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🆔 GAME ID: <code>{game_id}</code>\n"
         f"🎮 Платформа: <b>{platform_label}</b>\n"
         f"📊 ELO за победу: <b>+{win_d}</b> | за поражение: <b>-{loss_d}</b>\n\n"
-        f"Вставай в очередь: /play5 или /play2\n\n"
+        f"Вставай в очередь: /play5v5 или /play2v2\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
         f"⚠️ <b>За обман платформы вы получаете бан от администрации Faceit!</b>",
         parse_mode=ParseMode.HTML
@@ -1215,7 +1215,7 @@ async def play5_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "❌ <b>Лобби создаётся только в беседе!</b>\n\n"
             "Заходи в беседу и запускай там:\n"
-            "👉 https://t.me/+_tJYrsFI5jFhZTRi",
+            "👉 https://t.me/faceitggvp",
             parse_mode=ParseMode.HTML
         )
         return
@@ -1288,7 +1288,7 @@ async def admins_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         my_role = "👑 создатель"
         cmds = (
             "/mute /unmute · /ban /unban · /win\n"
-            "/setelo · /elo · /clearqueue · /matches\n"
+            "/setelo · /elo · /cleardb · /matches\n"
             "/bots1 · /bots2 · /unreg · /listdb\n"
             "/addmod · /removemod · /addadm · /removeadm"
         )
