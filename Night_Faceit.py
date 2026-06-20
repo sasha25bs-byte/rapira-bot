@@ -28,11 +28,11 @@ from telegram.constants import ParseMode
 
 import os as _os
 
-BOT_TOKEN = "ВСТАВЬ_ТОКЕН_СЮДА"  # ← сюда вставь свой токен от @BotFather
+BOT_TOKEN = "8771277676:AAER0fIck_J_YBAzW4Or9vtrFI7We6rQICk"  # ← сюда вставь свой токен от @BotFather
 
 # ── РОЛИ ──────────────────────────────────────────
 # Создатель — доступ ко всем командам
-CREATOR_ID       = 5839642306
+CREATOR_ID       = 7979653269
 # Админы — бан, мут, выдача эло за катки, создание матчей
 ADMIN_IDS        = [CREATOR_ID]
 # Модераторы — только мут и выдача каток (/win)
