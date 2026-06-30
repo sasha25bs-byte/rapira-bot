@@ -28,7 +28,7 @@ from telegram.constants import ParseMode
 
 import os as _os
 
-BOT_TOKEN = "8712650042:AAFXDA0sYg8l9pKk2_AL5BA3Yg1i2nkY0hQ"
+BOT_TOKEN = "8771277676:AAER0fIck_J_YBAzW4Or9vtrFI7We6rQICk"
 
 # ── РОЛИ ──────────────────────────────────────────
 # Создатель — доступ ко всем командам
