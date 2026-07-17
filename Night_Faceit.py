@@ -1566,12 +1566,30 @@ _CARD_ROW_BORDER  = (26, 25, 40)
 _CARD_LOGO_BG     = (17, 16, 28)
 _CARD_LOGO_BORDER = (58, 50, 90)
 
-_FONT_DIR = "/usr/share/fonts/truetype/dejavu/"
+_FONT_CANDIDATES = [
+    _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "fonts"),  # шрифты рядом со скриптом (в репо)
+    "/usr/share/fonts/truetype/dejavu",   # Debian/Ubuntu
+    "/usr/share/fonts/dejavu",            # некоторые другие дистрибутивы
+]
+
+
+def _find_font_path(name: str) -> Optional[str]:
+    for d in _FONT_CANDIDATES:
+        p = _os.path.join(d, name)
+        if _os.path.exists(p):
+            return p
+    return None
 
 
 def _card_font(size: int, bold: bool = True) -> ImageFont.FreeTypeFont:
     name = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
-    return ImageFont.truetype(_FONT_DIR + name, size)
+    path = _find_font_path(name)
+    if path:
+        return ImageFont.truetype(path, size)
+    # Крайний случай — шрифт не найден нигде. Используем встроенный шрифт PIL
+    # (без кириллицы, но хотя бы не роняет всю карточку).
+    print(f"⚠️ Шрифт {name} не найден ни в одном из путей: {_FONT_CANDIDATES}")
+    return ImageFont.load_default()
 
 
 def _card_draw_logo_icon(d: ImageDraw.ImageDraw, cx: float, cy: float, size: float,
@@ -1751,7 +1769,8 @@ async def top_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     card_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), f"_top_card_{update.effective_chat.id}.png")
     try:
         result = render_top_card(card_path)
-    except Exception:
+    except Exception as e:
+        print(f"⚠️ Не удалось сгенерировать карточку топа: {e!r}")
         result = None
 
     if not result:
