@@ -1935,9 +1935,84 @@ def _card_fit_font(d: ImageDraw.ImageDraw, txt: str, max_w: float, base_size: in
     return _card_font(min_size)
 
 
+def _player_recent_results(db: dict, uid: int, limit: int = 18) -> List[bool]:
+    """Возвращает список последних результатов игрока (True=победа, False=поражение),
+    от самого свежего к более старому — для сетки «Последние матчи» на карточке."""
+    finished = db.get("finished_matches", {})
+    items = sorted(finished.values(), key=lambda m: m.get("finished_ts", 0), reverse=True)
+    out: List[bool] = []
+    for m in items:
+        if uid in m.get("winners", []):
+            out.append(True)
+        elif uid in m.get("losers", []):
+            out.append(False)
+        else:
+            continue
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _card_header_gradient(w: int, h: int,
+                           left_color=(52, 24, 88), right_color=(9, 8, 15)) -> Image.Image:
+    """Горизонтальный градиент для баннера-шапки карточки (фиолетовый → тёмный)."""
+    grad = Image.new("RGB", (w, 1))
+    for x in range(w):
+        t = x / max(1, w - 1)
+        r = int(left_color[0] + (right_color[0] - left_color[0]) * t)
+        g = int(left_color[1] + (right_color[1] - left_color[1]) * t)
+        b = int(left_color[2] + (right_color[2] - left_color[2]) * t)
+        grad.putpixel((x, 0), (r, g, b))
+    return grad.resize((w, h))
+
+
+def _card_draw_header_deco(img: Image.Image, dr: ImageDraw.ImageDraw, w: int, h: int) -> None:
+    """Диагональные акцентные линии + полупрозрачный водяной знак «NF» в шапке (как на оригинале)."""
+    line_color = (94, 60, 150)
+    for x_off in (0, 46, 92):
+        x0, y0 = w - 220 + x_off, h + 20
+        x1, y1 = x0 + h + 40, -20
+        dr.line([(x0, y0), (x1, y1)], fill=line_color, width=3)
+
+    wm_font = _card_font(150)
+    wm = Image.new("RGBA", (420, 260), (0, 0, 0, 0))
+    wmd = ImageDraw.Draw(wm)
+    wmd.text((10, 10), "NF", font=wm_font, fill=(255, 255, 255, 16))
+    wm = wm.rotate(-10, expand=True, resample=Image.BICUBIC)
+    img.paste(wm, (w - 360, -40), wm)
+
+
+def _card_stat_box(d: ImageDraw.ImageDraw, x: float, y: float, w: float, h: float,
+                    label: str, value: str, pct: float, status_text: str, status_color) -> None:
+    d.rounded_rectangle([x, y, x + w, y + h], radius=16, fill=_CARD_ROW_BG, outline=_CARD_ROW_BORDER, width=1)
+    pad = 18
+    d.text((x + pad, y + pad), label, font=_card_font(16, bold=False), fill=_CARD_GRAY)
+    val_font = _card_fit_font(d, value, w - 2 * pad, 34)
+    d.text((x + pad, y + pad + 28), value, font=val_font, fill=_CARD_WHITE)
+    bar_y = y + h - 38
+    _card_draw_hbar(d, x + pad, bar_y, w - 2 * pad, 8, pct, _CARD_PURPLE_LIT)
+    d.text((x + pad, bar_y + 15), status_text, font=_card_font(14, bold=False), fill=status_color)
+
+
+def _card_quality(value: float, good_th: float, mid_th: float):
+    if value >= good_th:
+        return "Хорошо", _CARD_PURPLE_LIT
+    if value >= mid_th:
+        return "Средне", (200, 190, 130)
+    return "Низкий", _CARD_GRAY
+
+
+def _card_circle_mask(size: int) -> Image.Image:
+    m = Image.new("L", (size, size), 0)
+    ImageDraw.Draw(m).ellipse([0, 0, size - 1, size - 1], fill=255)
+    return m
+
+
 def render_stats_card(out_path: str, target_uid: int, avatar_bytes: Optional[bytes] = None,
                        group_name: str = "NightFaceit") -> Optional[str]:
-    """Рисует PNG-карточку профиля игрока (аналог render_top_card, но для /stats).
+    """Рисует PNG-карточку профиля игрока в стиле веб-приложения Night Faceit:
+    баннер-шапка, ряд плашек статистики, карта/локальная блокировка калибровки,
+    правая колонка (устройство, лига/места, последние матчи).
     Возвращает out_path, либо None если игрок не зарегистрирован / это тестовый бот."""
     db = load_db()
     s  = str(target_uid)
@@ -1965,39 +2040,58 @@ def render_stats_card(out_path: str, target_uid: int, avatar_bytes: Optional[byt
 
     total_games = p.wins + p.losses
     kd_val      = (p.total_kills / p.total_deaths) if p.total_deaths else float(p.total_kills)
-    wr_txt      = f"{p.avg:.0f}%" if total_games else "—"
-    platform_label = "Мобильный" if p.platform == "mobile" else "ПК"
+    wr_txt      = f"{p.avg:.0f}%" if total_games else "0%"
+    platform_label = "МОБИЛЬНЫЙ" if p.platform == "mobile" else "ПК"
     map_name    = MAPS_LIST[0] if MAPS_LIST else "Dust 2"
-
-    f_name  = _card_font(38)
-    f_sub   = _card_font(20, bold=False)
-    f_logo  = _card_font(22)
-    f_panel = _card_font(19, bold=False)
-    f_big   = _card_font(32)
-    f_mid   = _card_font(23)
-    f_small = _card_font(18, bold=False)
-    f_hex   = _card_font(19)
+    avg_kills   = round(p.total_kills / total_games, 1) if total_games else 0.0
+    calibrated  = p.is_calibrated()
 
     W = _CARD_W
-    H = 820
+    MARGIN   = 40
+    HEADER_H = 210
+    GAP      = 24
+    content_top = HEADER_H + GAP
+
+    LEFT_W   = 760
+    RIGHT_X  = MARGIN + LEFT_W + GAP
+    RIGHT_W  = W - MARGIN - RIGHT_X
+
+    # ── Предварительный расчёт высоты холста ──────────────────────────────
+    stat_box_h  = 150
+    map_h       = 230
+    left_bottom = content_top + 40 + stat_box_h + GAP + map_h
+
+    device_h  = 150 if calibrated else 92
+    league_h  = 284 if calibrated else 150
+    rm_rows   = 3
+    rm_h      = 44 + rm_rows * 50
+    right_bottom = content_top + device_h + 18 + league_h + 18 + rm_h
+
+    H = max(left_bottom, right_bottom) + 40 + 60
     img = Image.new("RGB", (W, H), _CARD_BG)
     dr  = ImageDraw.Draw(img)
 
-    # ── Шапка: аватар, ник, ID, роль ─────────────────────────────────────
-    avatar_size = 130
+    # ── Шапка-баннер ───────────────────────────────────────────────────────
+    img.paste(_card_header_gradient(W, HEADER_H), (0, 0))
+    dr = ImageDraw.Draw(img)
+    _card_draw_header_deco(img, dr, W, HEADER_H)
+
+    avatar_size = 120
     avatar_img  = _card_load_avatar(avatar_bytes, avatar_size)
     mask        = _card_round_mask(avatar_size)
-    img.paste(avatar_img, (40, 36), mask)
-    dr.rounded_rectangle([40, 36, 40 + avatar_size, 36 + avatar_size],
-                          radius=int(avatar_size * 0.22), outline=_CARD_LOGO_BORDER, width=2)
+    img.paste(avatar_img, (MARGIN, 45), mask)
+    dr.rounded_rectangle([MARGIN, 45, MARGIN + avatar_size, 45 + avatar_size],
+                          radius=int(avatar_size * 0.22), outline=_CARD_PURPLE_LIT, width=2)
 
-    name_x = 40 + avatar_size + 26
+    f_name  = _card_font(36)
+    f_sub   = _card_font(19, bold=False)
+    f_logo  = _card_font(22)
+
+    name_x = MARGIN + avatar_size + 26
     name = p.nickname if len(p.nickname) <= 20 else p.nickname[:19] + "…"
-    dr.text((name_x, 44), name, font=f_name, fill=_CARD_WHITE)
-
-    sub_y = 44 + 54
-    dr.text((name_x, sub_y),      f"GAME ID: {p.external_id or '—'}   {platform_label}", font=f_sub, fill=_CARD_GRAY)
-    dr.text((name_x, sub_y + 30), f"TG ID: {target_uid}", font=f_sub, fill=_CARD_GRAY)
+    dr.text((name_x, 50), name, font=f_name, fill=_CARD_WHITE)
+    dr.text((name_x, 96), f"GAME ID: {p.external_id or '—'}   •   {platform_label}   •   TG ID: {target_uid}",
+             font=f_sub, fill=(210, 200, 230))
 
     badges = []
     if is_creator(target_uid):
@@ -2007,88 +2101,205 @@ def render_stats_card(out_path: str, target_uid: int, avatar_bytes: Optional[byt
     elif is_moderator(target_uid):
         badges.append(("Модератор", (150, 220, 180)))
     if is_youtuber(target_uid):
-        badges.append(("YouTuber", _CARD_PURPLE_LIT))
+        badges.append(("YouTuber", (230, 210, 255)))
 
-    bx, by = name_x, sub_y + 64
+    bx, by = name_x, 130
     for label, color in badges:
         bw_ = dr.textbbox((0, 0), label, font=f_sub)[2] + 28
-        dr.rounded_rectangle([bx, by, bx + bw_, by + 34], radius=17, fill=_CARD_LOGO_BG, outline=color, width=2)
-        dr.text((bx + 14, by + 6), label, font=f_sub, fill=color)
+        dr.rounded_rectangle([bx, by, bx + bw_, by + 32], radius=16, fill=(0, 0, 0, 0), outline=color, width=2)
+        dr.text((bx + 14, by + 5), label, font=f_sub, fill=color)
         bx += bw_ + 12
 
-    # Плашка группы, как в /top
-    dr.rounded_rectangle([W - 300, 40, W - 40, 98], radius=15, fill=(13, 12, 22), outline=(36, 32, 54), width=1)
-    _card_draw_logo_icon(dr, W - 300 + 29, 69, 34)
-    dr.text((W - 300 + 57, 58), group_name, font=f_logo, fill=_CARD_WHITE)
+    dr.rounded_rectangle([W - 260, 36, W - 40, 90], radius=15, fill=(20, 14, 34), outline=(80, 60, 120), width=1)
+    _card_draw_logo_icon(dr, W - 260 + 27, 63, 32)
+    dr.text((W - 260 + 52, 52), group_name, font=f_logo, fill=_CARD_WHITE)
 
-    dr.line([(40, 210), (W - 40, 210)], fill=_CARD_ROW_BORDER, width=1)
+    # ── Левая колонка: заголовок «Статистика» + 4 плашки ──────────────────
+    f_section = _card_font(24)
+    f_tag     = _card_font(16, bold=False)
 
-    # ── Ряд 1: ранг / калибровка + K/D ───────────────────────────────────
-    py       = 234
-    panel_h  = 190
-    gap      = 20
-    panel_w  = (W - 80 - gap) // 2
-    x0, x1   = 40, 40 + panel_w
-    x0b, x1b = x1 + gap, x1 + gap + panel_w
+    dr.text((MARGIN, content_top), "📊 Статистика", font=f_section, fill=_CARD_WHITE)
+    tag_txt = SEASON_NAME
+    tag_w = dr.textbbox((0, 0), tag_txt, font=f_tag)[2] + 30
+    dr.rounded_rectangle([MARGIN + LEFT_W - tag_w, content_top, MARGIN + LEFT_W, content_top + 32],
+                          radius=16, fill=(17, 16, 28), outline=(40, 36, 60), width=1)
+    dr.text((MARGIN + LEFT_W - tag_w + 15, content_top + 6), tag_txt, font=f_tag, fill=_CARD_GRAY)
 
-    if p.is_calibrated():
-        _card_panel(dr, x0, py, x1, py + panel_h, "Ранг", f_panel)
+    boxes_y = content_top + 40
+    box_gap = 14
+    box_w   = (LEFT_W - 3 * box_gap) / 4
+
+    kd_q, kd_c   = _card_quality(kd_val, 1.3, 0.9)
+    wr_q, wr_c   = _card_quality(p.avg if total_games else 0.0, 60, 40)
+    avg_q, avg_c = _card_quality(avg_kills, 15, 8)
+
+    stats = [
+        ("K/D",      f"{kd_val:.2f}", min(100.0, kd_val / 2 * 100), kd_q, kd_c),
+        ("Win Rate", wr_txt,          p.avg if total_games else 0.0, wr_q, wr_c),
+        ("AVG",      f"{avg_kills:.1f}", min(100.0, avg_kills / 20 * 100), avg_q, avg_c),
+        ("Матчи",    str(total_games), min(100.0, total_games / 30 * 100), "Сыграно", _CARD_GRAY),
+    ]
+    for i, (label, value, pct, status_text, status_color) in enumerate(stats):
+        bx0 = MARGIN + i * (box_w + box_gap)
+        _card_stat_box(dr, bx0, boxes_y, box_w, stat_box_h, label, value, pct, status_text, status_color)
+
+    # ── Левая колонка: карта / блокировка калибровки ──────────────────────
+    map_y0 = boxes_y + stat_box_h + GAP
+    dr.rounded_rectangle([MARGIN, map_y0, MARGIN + LEFT_W, map_y0 + map_h],
+                          radius=18, fill=_CARD_ROW_BG, outline=_CARD_ROW_BORDER, width=1)
+
+    if calibrated:
+        dr.text((MARGIN + 24, map_y0 + 20), "🗺 Статистика по карте", font=_card_font(19, bold=False), fill=_CARD_GRAY)
+
+        circ_size = 100
+        circ = Image.new("RGB", (circ_size, circ_size), (150, 125, 90))
+        cdraw = ImageDraw.Draw(circ)
+        cdraw.pieslice([0, 0, circ_size - 1, circ_size - 1], start=200, end=380, fill=(112, 92, 62))
+        cmask = _card_circle_mask(circ_size)
+        img.paste(circ, (MARGIN + 24, map_y0 + 66), cmask)
+        dr.ellipse([MARGIN + 24, map_y0 + 66, MARGIN + 24 + circ_size, map_y0 + 66 + circ_size],
+                   outline=_CARD_LOGO_BORDER, width=2)
+
+        mx = MARGIN + 24 + circ_size + 28
+        dr.text((mx, map_y0 + 74), map_name, font=_card_font(28), fill=_CARD_WHITE)
+        dr.text((mx, map_y0 + 118), f"W = {p.wins}   L = {p.losses}", font=_card_font(19, bold=False), fill=(150, 190, 255))
+        dr.text((mx, map_y0 + 150), "Win Rate", font=_card_font(16, bold=False), fill=_CARD_GRAY)
+        dr.text((mx, map_y0 + 172), wr_txt, font=_card_font(34), fill=_CARD_PURPLE_LIT)
+    else:
+        left_matches = max(0, CALIBRATION_MATCHES - total_games)
+        dr.text((MARGIN + 24, map_y0 + 20), "🗺 Статистика по картам", font=_card_font(19, bold=False), fill=_CARD_GRAY)
+
+        # значок замка
+        lock_cx, lock_cy = MARGIN + LEFT_W // 2, map_y0 + 78
+        dr.arc([lock_cx - 16, lock_cy - 28, lock_cx + 16, lock_cy], start=180, end=360, fill=_CARD_GRAY, width=4)
+        dr.rounded_rectangle([lock_cx - 22, lock_cy - 4, lock_cx + 22, lock_cy + 30], radius=6,
+                              fill=(24, 22, 36), outline=_CARD_GRAY, width=2)
+
+        f_lock1 = _card_font(20)
+        f_lock2 = _card_font(15, bold=False)
+        line1 = "Подробная статистика по картам"
+        line2 = "откроется после калибровки"
+        line3 = f"Сыграйте ещё {left_matches} матч(ей), чтобы увидеть аналитику."
+        for text, yy, fnt, col in [
+            (line1, map_y0 + 122, f_lock1, _CARD_WHITE),
+            (line2, map_y0 + 150, f_lock1, _CARD_WHITE),
+            (line3, map_y0 + 182, f_lock2, _CARD_GRAY),
+        ]:
+            tw = dr.textbbox((0, 0), text, font=fnt)[2]
+            dr.text((MARGIN + LEFT_W / 2 - tw / 2, yy), text, font=fnt, fill=col)
+
+        dot_r = 5
+        dot_gap = 18
+        dots_total = CALIBRATION_MATCHES
+        start_x = MARGIN + LEFT_W / 2 - (dots_total - 1) * dot_gap / 2
+        for i in range(dots_total):
+            cx_d = start_x + i * dot_gap
+            cy_d = map_y0 + 208
+            col = _CARD_PURPLE_LIT if i < total_games else (60, 56, 78)
+            dr.ellipse([cx_d - dot_r, cy_d - dot_r, cx_d + dot_r, cy_d + dot_r], fill=col)
+
+    # ── Правая колонка: устройство/дата (+матчи/MVP) ───────────────────────
+    rx0, rx1 = RIGHT_X, W - MARGIN
+    ry = content_top
+    dr.rounded_rectangle([rx0, ry, rx1, ry + device_h], radius=18, fill=_CARD_ROW_BG, outline=_CARD_ROW_BORDER, width=1)
+
+    f_cell_lab = _card_font(15, bold=False)
+    f_cell_val = _card_font(20)
+    cell_w = (RIGHT_W - 3 * 20) / 2
+
+    def _cell(cx, cy, label, value, value_color=_CARD_WHITE):
+        dr.text((cx, cy), label, font=f_cell_lab, fill=_CARD_GRAY)
+        dr.text((cx, cy + 22), value, font=f_cell_val, fill=value_color)
+
+    _cell(rx0 + 20, ry + 20, "📱 Устройство", platform_label, _CARD_PURPLE_LIT)
+    _cell(rx0 + 20 + cell_w + 20, ry + 20, "📅 Дата регистрации", "—")
+    if calibrated:
+        _cell(rx0 + 20, ry + 86, "🎮 Матчей", str(total_games))
+        _cell(rx0 + 20 + cell_w + 20, ry + 86, "⭐ MVP", "—")
+
+    # ── Правая колонка: лига / места ────────────────────────────────────────
+    league_y0 = ry + device_h + 18
+    dr.rounded_rectangle([rx0, league_y0, rx1, league_y0 + league_h], radius=18,
+                          fill=_CARD_ROW_BG, outline=_CARD_ROW_BORDER, width=1)
+    dr.text((rx0 + 20, league_y0 + 18), "Лига", font=_card_font(15, bold=False), fill=_CARD_GRAY)
+    dr.text((rx0 + 20, league_y0 + 38), "Default", font=_card_font(26), fill=_CARD_WHITE)
+
+    star_cx, star_cy = rx1 - 40, league_y0 + 44
+    if calibrated:
         lvl = _lvl_number(p.elo)
         hc  = _card_level_color(lvl)
-        _card_draw_hex(dr, x0 + 70, py + panel_h // 2 + 8, 46, lvl, hc, f_hex)
-        dr.text((x0 + 150, py + 70), f"{p.elo} ELO", font=f_big, fill=_CARD_WHITE)
-        level, pct, to_next = _elo_progress(p.elo)
-        _card_draw_hbar(dr, x0 + 150, py + 124, panel_w - 190, 14, pct, hc)
-        next_txt = f"до LVL {level + 1}: {to_next} ELO" if to_next is not None else "Максимальный уровень"
-        dr.text((x0 + 150, py + 144), next_txt, font=f_small, fill=_CARD_GRAY)
+        _card_draw_hex(dr, star_cx, star_cy, 22, lvl, hc, _card_font(16))
     else:
-        _card_panel(dr, x0, py, x1, py + panel_h, "Калибровка", f_panel)
-        cal_pct = total_games / CALIBRATION_MATCHES * 100
-        left    = max(0, CALIBRATION_MATCHES - total_games)
-        _card_draw_hex(dr, x0 + 70, py + panel_h // 2 + 8, 46, total_games, (150, 150, 170), f_hex)
-        dr.text((x0 + 150, py + 70), f"{total_games}/{CALIBRATION_MATCHES} матчей", font=f_big, fill=_CARD_WHITE)
-        _card_draw_hbar(dr, x0 + 150, py + 124, panel_w - 190, 14, cal_pct, (150, 150, 170))
-        dr.text((x0 + 150, py + 144), f"Ещё {left} матч(ей) до получения ранга", font=f_small, fill=_CARD_GRAY)
+        _card_draw_hex(dr, star_cx, star_cy, 22, 0, (90, 88, 100), _card_font(16))
 
-    _card_panel(dr, x0b, py, x1b, py + panel_h, "K/D", f_panel)
-    ring_cx, ring_cy = x0b + 95, py + panel_h // 2 + 8
-    _card_draw_ring(dr, ring_cx, ring_cy, 62, min(100.0, kd_val / 2 * 100), (150, 190, 255))
-    kd_txt = f"{kd_val:.2f}"
-    ring_inner_w = 62 * 2 - 2 * 16 - 8  # диаметр кольца минус толщина обводки и небольшой отступ
-    f_ring_kd = _card_fit_font(dr, kd_txt, ring_inner_w, 32)
-    bbox = dr.textbbox((0, 0), kd_txt, font=f_ring_kd)
-    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    dr.text((ring_cx - tw / 2 - bbox[0], ring_cy - th / 2 - bbox[1]), kd_txt, font=f_ring_kd, fill=_CARD_WHITE)
-    dr.text((x0b + 190, py + 60),  f"Киллы: {p.total_kills}",  font=f_mid, fill=_CARD_WHITE)
-    dr.text((x0b + 190, py + 98),  f"Смерти: {p.total_deaths}", font=f_mid, fill=_CARD_WHITE)
-    avg_kills = round(p.total_kills / total_games, 1) if total_games else 0.0
-    dr.text((x0b + 190, py + 136), f"Ср. киллы/матч: {avg_kills}", font=f_small, fill=_CARD_GRAY)
+    if calibrated:
+        top_players = build_top_players(limit=3)
+        rows = list(enumerate(top_players, start=1))
+        own_in_top = any(pl.user_id == target_uid for pl in top_players)
+        if not own_in_top:
+            all_players = build_top_players(limit=1000)
+            own_rank = next((i for i, pl in enumerate(all_players, start=1) if pl.user_id == target_uid), None)
+            if own_rank:
+                rows.append((own_rank, p))
 
-    # ── Ряд 2: винрейт + карта (единственная в пуле) ─────────────────────
-    py2 = py + panel_h + gap
+        ry2 = league_y0 + 84
+        f_rank = _card_font(16, bold=False)
+        f_pname = _card_font(18)
+        f_pelo = _card_font(18)
+        for rank, pl in rows:
+            is_self = (pl.user_id == target_uid)
+            row_h = 42
+            if is_self:
+                dr.rounded_rectangle([rx0 + 12, ry2 - 6, rx1 - 12, ry2 + row_h - 6], radius=10,
+                                      outline=_CARD_PURPLE_LIT, width=2, fill=(22, 16, 36))
+            dr.text((rx0 + 20, ry2), f"#{rank}", font=f_rank, fill=_CARD_GRAY)
+            pname = pl.nickname if len(pl.nickname) <= 14 else pl.nickname[:13] + "…"
+            dr.text((rx0 + 62, ry2 - 2), pname, font=f_pname, fill=_CARD_WHITE if is_self else (215, 215, 224))
+            elo_txt = str(pl.elo)
+            ew = dr.textbbox((0, 0), elo_txt, font=f_pelo)[2]
+            dr.text((rx1 - 24 - ew, ry2 - 2), elo_txt, font=f_pelo, fill=_CARD_PURPLE_LIT if is_self else _CARD_WHITE)
+            ry2 += row_h
+    else:
+        dr.text((rx0 + 20, league_y0 + 84), "ELO", font=_card_font(15, bold=False), fill=_CARD_GRAY)
+        _card_draw_hex(dr, rx0 + 40, league_y0 + 128, 20, 0, (90, 88, 100), _card_font(16))
+        dr.text((rx0 + 70, league_y0 + 115), "0", font=_card_font(26), fill=_CARD_WHITE)
+        dr.text((rx0 + 20, league_y0 + 168), "Позиция в лиге", font=_card_font(15, bold=False), fill=_CARD_GRAY)
+        dr.text((rx0 + 20, league_y0 + 190), "—", font=_card_font(20), fill=_CARD_WHITE)
 
-    _card_panel(dr, x0, py2, x1, py2 + panel_h, "Winrate", f_panel)
-    ring_cx2, ring_cy2 = x0 + 95, py2 + panel_h // 2 + 8
-    _card_draw_ring(dr, ring_cx2, ring_cy2, 62, p.avg if total_games else 0.0, (150, 220, 160))
-    f_ring_wr = _card_fit_font(dr, wr_txt, ring_inner_w, 32)
-    bbox = dr.textbbox((0, 0), wr_txt, font=f_ring_wr)
-    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    dr.text((ring_cx2 - tw / 2 - bbox[0], ring_cy2 - th / 2 - bbox[1]), wr_txt, font=f_ring_wr, fill=_CARD_WHITE)
-    dr.text((x0 + 190, py2 + 60),  f"Побед: {p.wins}",      font=f_mid, fill=_CARD_WHITE)
-    dr.text((x0 + 190, py2 + 98),  f"Поражений: {p.losses}", font=f_mid, fill=_CARD_WHITE)
-    dr.text((x0 + 190, py2 + 136), f"Матчей: {total_games}", font=f_small, fill=_CARD_GRAY)
+    # ── Правая колонка: последние матчи ────────────────────────────────────
+    rm_y0 = league_y0 + league_h + 18
+    dr.rounded_rectangle([rx0, rm_y0, rx1, rm_y0 + rm_h], radius=18, fill=_CARD_ROW_BG, outline=_CARD_ROW_BORDER, width=1)
+    dr.text((rx0 + 20, rm_y0 + 16), "⚔ Последние матчи", font=_card_font(17, bold=False), fill=_CARD_GRAY)
 
-    _card_panel(dr, x0b, py2, x1b, py2 + panel_h, f"Карта — {map_name}", f_panel)
-    dr.text((x0b + 24, py2 + 62),  f"K/D: {kd_val:.2f}",        font=f_mid, fill=_CARD_WHITE)
-    dr.text((x0b + 24, py2 + 100), f"Winrate: {wr_txt}",        font=f_mid, fill=_CARD_WHITE)
-    dr.text((x0b + 24, py2 + 138), f"W {p.wins} / L {p.losses}", font=f_small, fill=_CARD_GRAY)
+    results = _player_recent_results(db, target_uid, limit=18)
+    cols = 6
+    cell = 40
+    cgap = 10
+    grid_x0 = rx0 + 20
+    grid_y0 = rm_y0 + 48
+    for idx in range(18):
+        col_i = idx % cols
+        row_i = idx // cols
+        gx = grid_x0 + col_i * (cell + cgap)
+        gy = grid_y0 + row_i * (cell + cgap)
+        if idx < len(results):
+            won = results[idx]
+            fill_c = (40, 130, 80) if won else (140, 45, 45)
+            dr.rounded_rectangle([gx, gy, gx + cell, gy + cell], radius=10, fill=fill_c)
+            letter = "W" if won else "L"
+            f_wl = _card_font(18)
+            tw, th = dr.textbbox((0, 0), letter, font=f_wl)[2:]
+            dr.text((gx + cell / 2 - tw / 2, gy + cell / 2 - th / 2), letter, font=f_wl, fill=_CARD_WHITE)
+        else:
+            dr.rounded_rectangle([gx, gy, gx + cell, gy + cell], radius=10, outline=(38, 36, 52), width=1)
 
-    # ── Подвал ─────────────────────────────────────────────────────────
-    fy = py2 + panel_h + 34
-    _card_draw_logo_icon(dr, W // 2 - 90, fy + 15, 30)
-    dr.text((W // 2 - 58, fy), "NIGHT FACEIT", font=f_logo, fill=_CARD_WHITE)
+    # ── Подвал ─────────────────────────────────────────────────────────────
+    footer_y = max(map_y0 + map_h, rm_y0 + rm_h) + 34
+    f_logo_footer = _card_font(22)
+    _card_draw_logo_icon(dr, W // 2 - 90, footer_y + 15, 30)
+    dr.text((W // 2 - 58, footer_y), "NIGHT FACEIT", font=f_logo_footer, fill=_CARD_WHITE)
 
-    H_actual = fy + 50
+    H_actual = footer_y + 50
     img = img.crop((0, 0, W, H_actual))
     img.save(out_path)
     return out_path
