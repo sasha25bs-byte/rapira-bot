@@ -8,9 +8,15 @@ from dataclasses import dataclass, asdict
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 
+import io
+import math
 import aiohttp
 from aiohttp import web
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, MenuButtonWebApp, WebAppInfo, ChatPermissions
+from PIL import Image, ImageDraw, ImageFont
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, MenuButtonWebApp, WebAppInfo,
+    ChatPermissions, BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats, BotCommandScopeDefault,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -28,7 +34,12 @@ from telegram.constants import ParseMode
 
 import os as _os
 
-BOT_TOKEN = _os.environ.get("BOT_TOKEN", "8771277676:AAF16vLtlzRN1RAzSZD8oD-bEZVdQvp2Y7s")
+BOT_TOKEN = _os.environ.get("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise RuntimeError(
+        "Переменная окружения BOT_TOKEN не задана. "
+        "Добавь её в Railway → Variables → BOT_TOKEN."
+    )
 
 # ── РОЛИ ──────────────────────────────────────────
 # Создатель — доступ ко всем командам
@@ -48,6 +59,9 @@ def _parse_id_list(env_value: str) -> list:
 ADMIN_IDS        = list({CREATOR_ID, *_parse_id_list(_os.environ.get("ADMIN_IDS", ""))})
 # Модераторы — только мут и выдача каток (/win). Переменная окружения MODERATOR_IDS.
 MODERATOR_IDS: list = _parse_id_list(_os.environ.get("MODERATOR_IDS", ""))
+# Ютуберы/контент-мейкеры — получают верификационный бейдж в профиле.
+# Переменная окружения YOUTUBER_IDS (через запятую).
+YOUTUBER_IDS: list = _parse_id_list(_os.environ.get("YOUTUBER_IDS", ""))
 
 WEBAPP_URL       = _os.environ.get("WEBAPP_URL", "")  # URL сайта на Railway
 DATA_FILE        = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "faceit_db.json")
@@ -71,7 +85,16 @@ def is_admin(uid: int) -> bool:
 def is_moderator(uid: int) -> bool:
     return uid in MODERATOR_IDS or is_admin(uid)
 
-MAPS_LIST      = ["Seaside"]
+def is_youtuber(uid: int) -> bool:
+    return uid in YOUTUBER_IDS
+
+# ── БЕСЕДА / СЕЗОН ────────────────────────────────
+BESEDA_LINK     = "https://t.me/faceitggvp"   # ссылка на беседу (там играются матчи)
+BESEDA_USERNAME = "@faceitggvp"               # username беседы для проверки подписки
+SEASON_NAME     = "Test Season"
+SEASON_END      = "20.07.2026"
+
+MAPS_LIST      = ["Seaside", "Dust 2"]
 LOBBY_5V5_SIZE = 10
 LOBBY_2V2_SIZE = 4
 PICK_TIMEOUT   = 90
@@ -485,6 +508,39 @@ def get_reply_target(update: Update, args: list) -> Optional[int]:
     return None
 
 
+async def is_subscribed_beseda(bot, uid: int) -> bool:
+    """Проверяет, состоит ли пользователь в беседе (по username)."""
+    try:
+        member = await bot.get_chat_member(BESEDA_USERNAME, uid)
+        return member.status in ("member", "administrator", "creator")
+    except Exception:
+        return False
+
+
+def _sub_gate_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➡️ Перейти в беседу", url=BESEDA_LINK)],
+        [InlineKeyboardButton("🔄 Я подписался", callback_data="reg_check_sub")],
+    ])
+
+
+async def dm_buttons_only(update: Update) -> bool:
+    """В ЛС для обычных игроков доступна только команда /start — всё
+    остальное делается через кнопки меню. Возвращает True, если апдейт
+    нужно заблокировать (и уже отправлено пояснение)."""
+    msg = update.message
+    if not msg or msg.chat.type != "private":
+        return False
+    uid = update.effective_user.id
+    if is_admin(uid) or is_moderator(uid):
+        return False
+    await msg.reply_text(
+        "ℹ️ В личных сообщениях боту доступна только команда /start.\n"
+        "Нажми /start и пользуйся кнопками меню 👇"
+    )
+    return True
+
+
 async def gate(update: Update, need_reg: bool = True, need_unmute: bool = False) -> bool:
     """Единая проверка. True = заблокировать. Админы всегда проходят.
     ВАЖНО: муты теперь блокируют АБСОЛЮТНО ЛЮБУЮ команду бота (не только
@@ -530,9 +586,9 @@ def lobby_text(mode: str, queue: List[int]) -> str:
     pct    = int(filled / size * 100)
 
     lines = [
-        f"╔══════════════════════╗",
-        f"║  {emoji}  <b>ЛОББИ {mode.upper()}</b>  {emoji}  ║",
-        f"╚══════════════════════╝",
+        f"╔══════════════╗",
+        f"║ {emoji} <b>ЛОББИ {mode.upper()}</b> {emoji} ║",
+        f"╚══════════════╝",
         f"",
         f"👥 Игроков: <b>{filled}/{size}</b>  •  <b>{pct}%</b>",
         f"<code>[{bar}]</code>",
@@ -542,20 +598,20 @@ def lobby_text(mode: str, queue: List[int]) -> str:
     medals = ["🥇", "🥈", "🥉"]
 
     if queue:
-        lines.append("┌─ <b>Игроки в очереди</b> ──────")
+        lines.append("┌─ <b>Игроки в очереди</b>")
         for i, uid in enumerate(queue, 1):
             p   = get_player(uid)
             num = medals[i - 1] if i <= 3 else f"<b>{i}.</b>"
             lines.append(
                 f"│ {num} {p.lvl_icon()} {p.tg_link()}\n"
-                f"│    <code>[{p.external_id or '???'}]</code>  ·  <b>{p.elo}</b> ELO"
+                f"│  <code>[{p.external_id or '???'}]</code> · <b>{p.elo}</b> ELO"
             )
-        lines.append("└───────────────────────────")
+        lines.append("└──────────────")
     else:
-        lines.append("┌───────────────────────────")
-        lines.append("│  <i>Очередь пока пуста...</i>")
-        lines.append("│  <i>Нажми кнопку и заходи! 👇</i>")
-        lines.append("└───────────────────────────")
+        lines.append("┌──────────────")
+        lines.append("│ <i>Очередь пока пуста...</i>")
+        lines.append("│ <i>Нажми кнопку и заходи! 👇</i>")
+        lines.append("└──────────────")
 
     return "\n".join(lines)
 
@@ -631,16 +687,10 @@ async def _bot_auto_pick(m_id: str, context: ContextTypes.DEFAULT_TYPE, chat_id:
             if _is_bot_uid(m["turn"]):
                 await _bot_auto_pick(m_id, context, chat_id, thread_id)
         else:
-            # Пик завершён — карта одна (Seaside), бан не нужен
+            # Пик игроков завершён
             task = _pick_timer_tasks.pop(m_id, None)
             if task:
                 task.cancel()
-            host_uid  = m.get("host_uid", ct_cap)
-            host_p    = get_player(host_uid)
-            host_side = "🔵 CT" if host_uid == ct_cap else "🔴 T"
-            final_map = m["maps"][0] if m["maps"] else "Seaside"
-            m["phase"] = "done"
-            save_db(db)
             try:
                 await context.bot.send_message(
                     chat_id=chat_id, message_thread_id=thread_id,
@@ -649,6 +699,41 @@ async def _bot_auto_pick(m_id: str, context: ContextTypes.DEFAULT_TYPE, chat_id:
                 )
             except Exception:
                 pass
+
+            if len(m["maps"]) > 1:
+                # Карт больше одной — начинаем бан карт. Первым банит CT-капитан.
+                m["phase"] = "ban"
+                m["turn"] = ct_cap
+                m["ban_start_time"] = time.time()
+                save_db(db)
+                ban_btns = [
+                    [InlineKeyboardButton(f"🚫 {mn}", callback_data=f"bn_{m_id}_{mn}")]
+                    for mn in m["maps"]
+                ]
+                ban_txt = _ban_status_text(m_id, m, m.get("ban_timeout", BAN_TIMEOUT))
+                try:
+                    sent = await context.bot.send_message(
+                        chat_id=chat_id, message_thread_id=thread_id,
+                        text=ban_txt,
+                        reply_markup=InlineKeyboardMarkup(ban_btns),
+                        parse_mode=ParseMode.HTML
+                    )
+                    m["ban_msg_id"] = sent.message_id
+                    save_db(db)
+                except Exception:
+                    pass
+                ban_task = asyncio.create_task(_ban_timer(m_id, context, chat_id))
+                _ban_timer_tasks[m_id] = ban_task
+                if _is_bot_uid(m["turn"]):
+                    await _bot_auto_ban(m_id, context, chat_id, thread_id)
+                return
+
+            host_uid  = m.get("host_uid", ct_cap)
+            host_p    = get_player(host_uid)
+            host_side = "🔵 CT" if host_uid == ct_cap else "🔴 T"
+            final_map = m["maps"][0] if m["maps"] else "Seaside"
+            m["phase"] = "done"
+            save_db(db)
             await _announce_lobby_ready(context, chat_id, thread_id, m_id, m, host_p, host_side, final_map)
     elif phase == "ban":
         await _bot_auto_ban(m_id, context, chat_id, thread_id)
@@ -992,12 +1077,17 @@ async def start_match(players: List[int], mode: str, db: Dict,
     except Exception as e:
         print(f"[start_match] не удалось отправить тег-сообщение матча #{m_id}: {e}")
 
+    map_line = (
+        f"🗺 Карта: <b>{MAPS_LIST[0]}</b>\n\n"
+        if len(MAPS_LIST) == 1 else
+        f"🗺 Карты в пуле: <b>{', '.join(MAPS_LIST)}</b> (после пика — бан карт)\n\n"
+    )
     txt = (
         f"🆕 <b>Матч #{m_id} [{mode.upper()}]</b>\n\n"
         f"🔵 CT капитан: {ct_p.tg_link()} <code>[{ct_p.external_id or '?'}]</code>\n"
         f"🔴 T  капитан: {t_p.tg_link()} <code>[{t_p.external_id or '?'}]</code>\n\n"
         f"🖥 Создает лобби: {host_p.tg_link()} ({host_side})\n📨 Не забудь отправить в чат код от лобби\n\n"
-        f"🗺 Карта: <b>{MAPS_LIST[0]}</b>\n\n"
+        f"{map_line}"
         f"👥 В пуле: {len(pool)} игроков\n"
         f"⏳ На пик: <b>{PICK_TIMEOUT} сек</b>\n\n"
         f"Ход: 🔵 CT — выбирает первого игрока"
@@ -1039,50 +1129,72 @@ def _create_fake_bot(db: Dict) -> int:
 #              ПУБЛИЧНЫЕ КОМАНДЫ
 # ════════════════════════════════════════════════
 
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /start — приветствие"""
-    uid  = update.effective_user.id
-    name = update.effective_user.first_name or "игрок"
-    db   = load_db()
-    s    = str(uid)
-    reg  = s in db["players"] and db["players"][s].get("external_id")
-
+def main_menu_kb(uid: int, reg: bool) -> InlineKeyboardMarkup:
+    """Главное меню в ЛС — только кнопки, только то, что реально есть в боте."""
     keyboard = []
     if WEBAPP_URL:
         keyboard.append([InlineKeyboardButton(
             "🌐 Открыть Night Faceit Stats",
             web_app=WebAppInfo(url=WEBAPP_URL)
         )])
-    keyboard.append([
-        InlineKeyboardButton("📊 Мой профиль", callback_data="cmd_stats"),
-        InlineKeyboardButton("🏆 Топ",         callback_data="cmd_top"),
-    ])
-    if not reg:
+    keyboard.append([InlineKeyboardButton("🔍 Найти матч", callback_data="cmd_play")])
+    if reg:
+        keyboard.append([InlineKeyboardButton("📊 Мой профиль", callback_data="cmd_stats")])
+    else:
         keyboard.append([InlineKeyboardButton("📝 Регистрация", callback_data="cmd_reg")])
+    keyboard.append([
+        InlineKeyboardButton("🏆 Топ",   callback_data="cmd_top"),
+        InlineKeyboardButton("✨ Сезон", callback_data="cmd_season"),
+    ])
+    keyboard.append([
+        InlineKeyboardButton("📜 Правила",   callback_data="cmd_rules"),
+        InlineKeyboardButton("🆘 Поддержка", callback_data="cmd_support"),
+    ])
+    if is_moderator(uid):
+        keyboard.append([InlineKeyboardButton("🌙 Команда Faceit", callback_data="cmd_admins")])
+    return InlineKeyboardMarkup(keyboard)
 
+
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /start — приветствие."""
+    uid  = update.effective_user.id
+    name = update.effective_user.first_name or "игрок"
+    db   = load_db()
+    s    = str(uid)
+    reg  = bool(s in db["players"] and db["players"][s].get("external_id"))
+
+    # ── Группа/беседа: тут всё по полным командам, кнопочное меню не нужно ──
+    if update.message and update.message.chat.type != "private":
+        text = (
+            f"🌙 <b>Night Faceit</b>\n\n"
+            f"<b>Команды:</b>\n"
+            f"/reg — Регистрация\n"
+            f"/5v5 — Лобби 5v5\n"
+            f"/2v2 — Лобби 2v2\n"
+            f"/stats — Твоя статистика\n"
+            f"/top — Топ игроков\n"
+            f"/admins — Список команд по ролям\n"
+            f"/rules — Правила"
+        )
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+        return
+
+    # ── ЛС: только кнопки, без личных данных вроде ID/баланса ──
     text = (
         f"👋 <b>Привет, {name}!</b>\n\n"
         f"🌙 <b>Night Faceit</b> — твоя персональная лига\n\n"
         f"{'✅ Ты зарегистрирован' if reg else '❌ Ты не зарегистрирован'}\n\n"
-        f"📝 <b>Регистрация:</b> <code>/reg GAME_ID Никнейм pc/mobile</code>\n"
-        f"   Пример: <code>/reg 6888 Londyyy pc</code>\n\n"
-        f"🎮 <b>Лобби</b> создаётся <b>только в беседе</b> — в ЛС не работает!\n\n"
-        f"<b>Команды:</b>\n"
-        f"/reg — Регистрация\n"
-        f"/5v5 — Лобби 5v5\n"
-        f"/2v2 — Лобби 2v2\n"
-        f"/stats — Твоя статистика\n"
-        f"/top — Топ игроков\n"
-        f"/admins — Список команд по ролям"
+        f"👇 Выбери действие:"
     )
     await update.message.reply_text(
         text,
         parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        reply_markup=main_menu_kb(uid, reg)
     )
 
 
 async def reg_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await dm_buttons_only(update): return
     if await gate(update, need_reg=False): return
     uid = update.effective_user.id
     s   = str(uid)
@@ -1164,7 +1276,7 @@ async def reg_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🎮 Платформа: <b>{platform_label}</b>\n"
         f"📊 ELO за победу: <b>+{win_d}</b> | за поражение: <b>-{loss_d}</b>\n\n"
         f"Вставай в очередь: /5v5 или /2v2\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"━━━━━━━━━━━━━━\n"
         f"⚠️ <b>За обман платформы вы получаете бан от администрации Faceit!</b>",
         parse_mode=ParseMode.HTML
     )
@@ -1276,7 +1388,123 @@ async def platform_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+def _elo_progress(elo: int):
+    """Возвращает (уровень, % прогресса до след. уровня, ELO до след. уровня или None на макс. уровне)."""
+    bounds = [
+        (0, 500), (501, 750), (751, 900), (901, 1050), (1051, 1200),
+        (1201, 1350), (1351, 1530), (1531, 1750), (1751, 2000), (2001, 10**9),
+    ]
+    for i, (lo, hi) in enumerate(bounds):
+        if lo <= elo <= hi:
+            level = i + 1
+            if level == 10:
+                return level, 100, None
+            span = hi - lo + 1
+            pct = int(((elo - lo) / span) * 100)
+            to_next = hi + 1 - elo
+            return level, pct, to_next
+    return 1, 0, 501
+
+
+def _progress_bar(pct: int, length: int = 10) -> str:
+    filled = max(0, min(length, round(pct / 100 * length)))
+    return "▰" * filled + "▱" * (length - filled)
+
+
+def build_stats_text(target: int, looking_at_self: bool, private_chat: bool = True) -> tuple:
+    """Возвращает (text, keyboard) для профиля игрока target. Переиспользуется
+    и командой /stats (в беседе), и кнопкой «📊 Мой профиль» в ЛС.
+
+    private_chat: web_app-кнопки Telegram разрешает ТОЛЬКО в личных чатах с ботом —
+    в группах это вызывает ошибку BUTTON_TYPE_INVALID. Поэтому кнопку добавляем
+    только если сейчас действительно ЛС."""
+    db = load_db()
+    s  = str(target)
+
+    if s not in db["players"] or not db["players"][s].get("external_id"):
+        if looking_at_self:
+            return (
+                "❌ Вы не зарегистрированы!\n\n"
+                "Нажмите «📝 Регистрация» в главном меню — /start.",
+                None
+            )
+        return ("❌ Этот пользователь не зарегистрирован.", None)
+
+    d = db["players"][s]
+    for field, val in [("wins",0),("losses",0),("avg",0.0),("elo",1000),
+                       ("elo_5v5",1000),("elo_2v2",1000),
+                       ("wins_5v5",0),("losses_5v5",0),
+                       ("wins_2v2",0),("losses_2v2",0),
+                       ("avg_5v5",0.0),("avg_2v2",0.0),
+                       ("external_id",""),("is_bot",False),("nickname","?"),("user_id",target),
+                       ("total_kills",0),("total_deaths",0),
+                       ("platform","pc")]:
+        d.setdefault(field, val)
+
+    p = _make_player(d)
+
+    if p.is_bot:
+        return ("🤖 Это тестовый бот — статистики нет.", None)
+
+    total_games = p.wins + p.losses
+    total_wr    = f"{p.avg:.1f}%" if total_games else "—"
+    unified_elo = p.elo
+
+    if is_creator(target):
+        role_line = "👑 <b>Создатель</b>\n"
+    elif is_admin(target):
+        role_line = "🛡 <b>Администратор</b>\n"
+    elif is_moderator(target):
+        role_line = "🔰 <b>Модератор</b>\n"
+    else:
+        role_line = ""
+
+    def lvl_icon_for(elo: int) -> str:
+        if elo >= 2001: return "🏆 LVL 10"
+        if elo >= 1751: return "🔴 LVL 9"
+        if elo >= 1531: return "🔴 LVL 8"
+        if elo >= 1351: return "🟠 LVL 7"
+        if elo >= 1201: return "🟠 LVL 6"
+        if elo >= 1051: return "🟡 LVL 5"
+        if elo >= 901:  return "🟡 LVL 4"
+        if elo >= 751:  return "🟢 LVL 3"
+        if elo >= 501:  return "🟢 LVL 2"
+        return "⚪ LVL 1"
+
+    platform_label = "📱 Мобильный" if p.platform == "mobile" else "🖥 ПК"
+    kd_label = f"{round(p.total_kills / p.total_deaths, 2)}" if p.total_deaths else f"{p.total_kills}"
+
+    level, pct, to_next = _elo_progress(unified_elo)
+    bar = _progress_bar(pct)
+    next_line = f"до LVL {level+1}: <b>{to_next}</b> ELO" if to_next is not None else "🏆 максимальный уровень"
+
+    text = (
+        f"✦ {p.tg_link()} ✦\n"
+        f"🆔 <code>{p.external_id or 'не указан'}</code>   {platform_label}\n"
+        f"{role_line}"
+        f"━━━━━━━━━━━━━━\n"
+        f"{lvl_icon_for(unified_elo)}   <b>{unified_elo}</b> ELO\n"
+        f"{bar}  {pct}%\n"
+        f"{next_line}\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"🏆 Побед: <b>{p.wins}</b>      💀 Поражений: <b>{p.losses}</b>\n"
+        f"📈 Winrate: <b>{total_wr}</b>      🎮 Матчей: <b>{total_games}</b>\n"
+        f"🔫 K/D: <b>{kd_label}</b>  <i>({p.total_kills}/{p.total_deaths})</i>\n"
+        f"━━━━━━━━━━━━━━"
+    )
+
+    kb = None
+    if looking_at_self and WEBAPP_URL and private_chat:
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton(
+            "📊 Подробная статистика и история матчей",
+            web_app=WebAppInfo(url=WEBAPP_URL)
+        )]])
+
+    return (text, kb)
+
+
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await dm_buttons_only(update): return
     try:
         uid    = update.effective_user.id
         target = uid
@@ -1294,86 +1522,10 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except ValueError:
                 await update.message.reply_text("Формат: /stats [user_id]"); return
 
-        db = load_db()
-        s  = str(target)
         looking_at_self = (target == uid)
-
-        if s not in db["players"] or not db["players"][s].get("external_id"):
-            if looking_at_self:
-                await update.message.reply_text(
-                    "❌ Вы не зарегистрированы!\n\n"
-                    "Для регистрации введите:\n"
-                    "<code>/reg GAME_ID Никнейм</code>",
-                    parse_mode=ParseMode.HTML
-                )
-            else:
-                await update.message.reply_text(
-                    "❌ Этот пользователь не зарегистрирован.",
-                    parse_mode=ParseMode.HTML
-                )
-            return
-
-        d = db["players"][s]
-        for field, val in [("wins",0),("losses",0),("avg",0.0),("elo",1000),
-                           ("elo_5v5",1000),("elo_2v2",1000),
-                           ("wins_5v5",0),("losses_5v5",0),
-                           ("wins_2v2",0),("losses_2v2",0),
-                           ("avg_5v5",0.0),("avg_2v2",0.0),
-                           ("external_id",""),("is_bot",False),("nickname","?"),("user_id",target),
-                           ("total_kills",0),("total_deaths",0),
-                           ("platform","pc")]:
-            d.setdefault(field, val)
-
-        p = _make_player(d)
-
-        if p.is_bot:
-            await update.message.reply_text("🤖 Это тестовый бот — статистики нет.")
-            return
-
-        total_5v5 = p.wins_5v5 + p.losses_5v5
-        total_2v2 = p.wins_2v2 + p.losses_2v2
-        total_games = p.wins + p.losses
-        total_wr    = f"{p.avg:.1f}%" if total_games else "—"
-        unified_elo = p.elo
-
-        # Роль для стаффа
-        if is_creator(target):
-            role_line = "👑 <b>Создатель</b>\n"
-        elif is_admin(target):
-            role_line = "🛡 <b>Администратор</b>\n"
-        elif is_moderator(target):
-            role_line = "🔰 <b>Модератор</b>\n"
-        else:
-            role_line = ""
-
-        def lvl_icon_for(elo: int) -> str:
-            if elo >= 2001: return "🏆 LVL 10"
-            if elo >= 1751: return "🔴 LVL 9"
-            if elo >= 1531: return "🔴 LVL 8"
-            if elo >= 1351: return "🟠 LVL 7"
-            if elo >= 1201: return "🟠 LVL 6"
-            if elo >= 1051: return "🟡 LVL 5"
-            if elo >= 901:  return "🟡 LVL 4"
-            if elo >= 751:  return "🟢 LVL 3"
-            if elo >= 501:  return "🟢 LVL 2"
-            return "⚪ LVL 1"
-
-        platform_label = "📱 Мобильный" if p.platform == "mobile" else "🖥 ПК"
-        kd_label = f"{round(p.total_kills / p.total_deaths, 2)}" if p.total_deaths else f"{p.total_kills}"
-
-        await update.message.reply_text(
-            f"✦ {p.tg_link()} ✦\n"
-            f"🆔 <code>{p.external_id or 'не указан'}</code>\n"
-            f"{role_line}"
-            f"🎮 Платформа: <b>{platform_label}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"{lvl_icon_for(unified_elo)} <b>{unified_elo}</b> ELO\n"
-            f"🏆 Побед: <b>{p.wins}</b>  💀 Поражений: <b>{p.losses}</b>\n"
-            f"📈 Winrate: <b>{total_wr}</b>  🎮 Матчей: <b>{total_games}</b>\n"
-            f"🔫 KD: <b>{kd_label}</b> ({p.total_kills}/{p.total_deaths})\n"
-            f"━━━━━━━━━━━━━━━━━━━━━",
-            parse_mode=ParseMode.HTML
-        )
+        private_chat = (update.effective_chat.type == "private")
+        text, kb = build_stats_text(target, looking_at_self, private_chat)
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
     except Exception as e:
         import traceback
         print(f"[stats_cmd ERROR] uid={update.effective_user.id} error={e}\n{traceback.format_exc()}")
@@ -1394,8 +1546,165 @@ async def listdb_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
-async def top_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await gate(update): return
+# ════════════════════════════════════════════════
+#              КАРТОЧКА ТОП-10 (PNG)
+# ════════════════════════════════════════════════
+
+_CARD_W          = 1200
+_CARD_HEADER_H   = 230
+_CARD_ROW_H      = 108
+_CARD_ROW_GAP    = 14
+_CARD_PAD_BOTTOM = 30
+
+_CARD_BG          = (7, 7, 13)
+_CARD_PURPLE      = (124, 92, 255)
+_CARD_PURPLE_LIT  = (170, 148, 255)
+_CARD_WHITE       = (238, 238, 244)
+_CARD_GRAY        = (126, 133, 150)
+_CARD_ROW_BG      = (13, 13, 22)
+_CARD_ROW_BORDER  = (26, 25, 40)
+_CARD_LOGO_BG     = (17, 16, 28)
+_CARD_LOGO_BORDER = (58, 50, 90)
+
+_FONT_DIR = "/usr/share/fonts/truetype/dejavu/"
+
+
+def _card_font(size: int, bold: bool = True) -> ImageFont.FreeTypeFont:
+    name = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
+    return ImageFont.truetype(_FONT_DIR + name, size)
+
+
+def _card_draw_logo_icon(d: ImageDraw.ImageDraw, cx: float, cy: float, size: float,
+                          color=_CARD_PURPLE_LIT, bg=_CARD_LOGO_BG, border=_CARD_LOGO_BORDER, bw: int = 2):
+    r = size / 2
+    d.rounded_rectangle([cx - r, cy - r, cx + r, cy + r], radius=r * 0.32, fill=bg, outline=border, width=bw)
+    w = max(3, int(size * 0.09))
+    d.line([(cx - r * 0.42, cy - r * 0.48), (cx - r * 0.02, cy + r * 0.42), (cx + r * 0.12, cy - r * 0.02)],
+           fill=color, width=w, joint="curve")
+    d.line([(cx + r * 0.12, cy - r * 0.02), (cx + r * 0.42, cy - r * 0.48)], fill=color, width=w, joint="curve")
+
+
+def _card_draw_hex(d: ImageDraw.ImageDraw, cx: float, cy: float, size: float, number: int, color, font):
+    pts = [(cx + size * math.cos(math.pi / 6 + i * math.pi / 3),
+            cy + size * math.sin(math.pi / 6 + i * math.pi / 3)) for i in range(6)]
+    d.polygon(pts, outline=color, width=3)
+    txt = str(number)
+    bbox = d.textbbox((0, 0), txt, font=font)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    d.text((cx - tw / 2 - bbox[0], cy - th / 2 - bbox[1]), txt, font=font, fill=color)
+
+
+def _card_level_color(lvl: int):
+    if lvl >= 8:
+        return (255, 104, 0)
+    if lvl >= 4:
+        return (255, 184, 0)
+    return (150, 200, 130)
+
+
+def _lvl_number(elo: int) -> int:
+    if elo >= 2001: return 10
+    if elo >= 1751: return 9
+    if elo >= 1531: return 8
+    if elo >= 1351: return 7
+    if elo >= 1201: return 6
+    if elo >= 1051: return 5
+    if elo >= 901:  return 4
+    if elo >= 751:  return 3
+    if elo >= 501:  return 2
+    return 1
+
+
+def build_top_players(limit: int = 10) -> List[Player]:
+    """Возвращает игроков, отсортированных по ELO (используется и текстом, и карточкой)."""
+    db      = load_db()
+    players = []
+    for d in db["players"].values():
+        if not d.get("external_id") or d.get("is_bot"): continue
+        for field, val in [("wins", 0), ("losses", 0), ("avg", 0.0), ("elo", 1000),
+                            ("elo_5v5", 1000), ("elo_2v2", 1000),
+                            ("wins_5v5", 0), ("losses_5v5", 0),
+                            ("wins_2v2", 0), ("losses_2v2", 0),
+                            ("avg_5v5", 0.0), ("avg_2v2", 0.0),
+                            ("external_id", ""), ("is_bot", False),
+                            ("total_kills", 0), ("total_deaths", 0),
+                            ("platform", "pc")]:
+            d.setdefault(field, val)
+        d["elo"] = max(d.get("elo", 1000), d.get("elo_5v5", 1000), d.get("elo_2v2", 1000))
+        try:
+            players.append(_make_player(d))
+        except Exception:
+            continue
+    players.sort(key=lambda p: p.elo, reverse=True)
+    return players[:limit]
+
+
+def render_top_card(out_path: str, group_name: str = "NightFaceit", limit: int = 10) -> Optional[str]:
+    """Рисует PNG-карточку топ-игроков (актуальные данные из БД) и сохраняет в out_path.
+    Возвращает out_path, либо None если рейтинг пуст."""
+    players = build_top_players(limit)
+    if not players:
+        return None
+
+    f_title = _card_font(48)
+    f_logo  = _card_font(24)
+    f_head  = _card_font(19, bold=False)
+    f_rank  = _card_font(26)
+    f_name  = _card_font(27)
+    f_stat  = _card_font(25)
+    f_hex   = _card_font(19)
+
+    n = len(players)
+    H = _CARD_HEADER_H + n * (_CARD_ROW_H + _CARD_ROW_GAP) + _CARD_PAD_BOTTOM
+    img = Image.new("RGB", (_CARD_W, H), _CARD_BG)
+    d = ImageDraw.Draw(img)
+
+    d.text((40, 32), "ТОП", font=f_title, fill=_CARD_PURPLE_LIT)
+    tw = d.textbbox((0, 0), "ТОП ", font=f_title)[2]
+    d.text((40 + tw, 32), "ИГРОКИ", font=f_title, fill=_CARD_WHITE)
+
+    d.rounded_rectangle([40, 100, 300, 158], radius=15, fill=(13, 12, 22), outline=(36, 32, 54), width=1)
+    _card_draw_logo_icon(d, 70, 129, 34)
+    d.text((98, 118), group_name, font=f_logo, fill=_CARD_WHITE)
+
+    headers = [("Место", 40), ("Игрок", 175), ("Матчи", 600), ("% побед", 730), ("Очки", 880), ("K/D", 1075)]
+    hy = 195
+    for text, x in headers:
+        d.text((x, hy), text, font=f_head, fill=_CARD_GRAY)
+    d.line([(40, hy + 33), (_CARD_W - 40, hy + 33)], fill=_CARD_ROW_BORDER, width=1)
+
+    y = hy + 48
+    for i, p in enumerate(players, start=1):
+        d.rounded_rectangle([40, y, _CARD_W - 40, y + _CARD_ROW_H], radius=16,
+                             fill=_CARD_ROW_BG, outline=_CARD_ROW_BORDER, width=1)
+        cy = y + _CARD_ROW_H // 2
+        d.text((40 + 24, cy - 16), str(i), font=f_rank, fill=_CARD_WHITE)
+        _card_draw_logo_icon(d, 175 + 38, cy, 58)
+
+        name = p.nickname if len(p.nickname) <= 16 else p.nickname[:15] + "…"
+        d.text((175 + 90, cy - 15), name, font=f_name, fill=_CARD_WHITE)
+
+        total = p.wins + p.losses
+        wr    = f"{p.avg:.0f}%" if total else "—"
+        kd    = (p.total_kills / p.total_deaths) if p.total_deaths else 0.0
+
+        d.text((600, cy - 14), str(total), font=f_stat, fill=_CARD_WHITE)
+        d.text((730, cy - 14), wr, font=f_stat, fill=_CARD_WHITE)
+
+        lvl = _lvl_number(p.elo)
+        hc  = _card_level_color(lvl)
+        _card_draw_hex(d, 880 + 20, cy, 21, lvl, hc, f_hex)
+        d.text((880 + 55, cy - 14), str(p.elo), font=f_stat, fill=_CARD_WHITE)
+        d.text((1075, cy - 14), f"{kd:.2f}", font=f_stat, fill=_CARD_WHITE)
+
+        y += _CARD_ROW_H + _CARD_ROW_GAP
+
+    img.save(out_path)
+    return out_path
+
+
+def build_top_text() -> str:
+    """Текст топ-10 игроков. Переиспользуется /top и кнопкой «🏆 Топ»."""
     db      = load_db()
     players = []
     for d in db["players"].values():
@@ -1417,12 +1726,11 @@ async def top_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             continue
 
     if not players:
-        await update.message.reply_text("🏆 Рейтинг пока пуст.")
-        return
+        return "🏆 Рейтинг пока пуст."
 
     players.sort(key=lambda p: p.elo, reverse=True)
     medals = ["🥇","🥈","🥉","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
-    lines  = ["🏆 <b>Топ-10 — Night Faceit</b>\n━━━━━━━━━━━━━━━"]
+    lines  = ["🏆 <b>Топ-10 — Night Faceit</b>\n━━━━━━━━━━━━━━"]
     for i, p in enumerate(players[:10]):
         total = p.wins + p.losses
         wr    = f"{p.avg:.1f}%" if total else "—"
@@ -1433,17 +1741,60 @@ async def top_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(players) > 10:
         lines.append(f"\n... и ещё {len(players)-10} в рейтинге")
 
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    return "\n".join(lines)
+
+
+async def top_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await dm_buttons_only(update): return
+    if await gate(update): return
+
+    card_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), f"_top_card_{update.effective_chat.id}.png")
+    try:
+        result = render_top_card(card_path)
+    except Exception:
+        result = None
+
+    if not result:
+        await update.message.reply_text(build_top_text(), parse_mode=ParseMode.HTML)
+        return
+
+    try:
+        with open(result, "rb") as f:
+            await update.message.reply_photo(photo=f)
+    finally:
+        try:
+            os.remove(result)
+        except OSError:
+            pass
+
+
+DM_LOBBY_WARNING = (
+    "⚠️ <b>Внимание</b>\n\n"
+    "Лобби можно собрать прямо здесь, в ЛС. Но играется матч всё равно "
+    "на сервере, а <b>итоги (скриншот со счётом) отправляются в беседу "
+    f"нашей платформы</b> ({BESEDA_USERNAME}), в раздел <b>game scrin</b>, "
+    "с указанием номера матча в подписи к фото."
+)
+
+
+async def _open_lobby_from_dm(update: Update, mode: str):
+    """Показывает предупреждение и сразу лобби при вызове /5v5 или /2v2 из ЛС."""
+    uid = update.effective_user.id
+    if not is_registered(uid) and uid not in ADMIN_IDS:
+        await update.message.reply_text(NOT_REGISTERED_MSG, parse_mode=ParseMode.HTML)
+        return
+    db = load_db()
+    q_list = db.get(f"queue_{mode}", [])
+    await update.message.reply_text(
+        DM_LOBBY_WARNING + "\n\n" + lobby_text(mode, q_list),
+        reply_markup=lobby_kb(mode, uid, q_list),
+        parse_mode=ParseMode.HTML
+    )
 
 
 async def play5_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message and update.message.chat.type == "private":
-        await update.message.reply_text(
-            "❌ <b>Лобби создаётся только в беседе!</b>\n\n"
-            "Заходи в беседу и запускай там:\n"
-            "👉 https://t.me/faceitggvp",
-            parse_mode=ParseMode.HTML
-        )
+        await _open_lobby_from_dm(update, "5v5")
         return
     if await gate(update, need_unmute=True): return
     uid = update.effective_user.id
@@ -1463,12 +1814,7 @@ async def play5_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def play2_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message and update.message.chat.type == "private":
-        await update.message.reply_text(
-            "❌ <b>Лобби создаётся только в беседе!</b>\n\n"
-            "Заходи в беседу и запускай там:\n"
-            "👉 https://t.me/faceitggvp",
-            parse_mode=ParseMode.HTML
-        )
+        await _open_lobby_from_dm(update, "2v2")
         return
     if await gate(update, need_unmute=True): return
     uid = update.effective_user.id
@@ -1525,12 +1871,10 @@ DURATION_NOTE = (
 )
 
 
-async def admins_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /admins — список доступных команд по роли + состав стаффа"""
-    uid = update.effective_user.id
+def build_admins_text(uid: int) -> str:
+    """Текст со списком стаффа и команд по роли. Переиспользуется /admins и кнопкой меню."""
     db  = load_db()
 
-    # Собираем стафф
     def _get_link(user_id: int) -> str:
         s = str(user_id)
         if s in db["players"] and db["players"][s].get("nickname"):
@@ -1546,6 +1890,9 @@ async def admins_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             staff_lines.append(f"· {_get_link(aid)} <i>(админ)</i>")
     for mid in MODERATOR_IDS:
         staff_lines.append(f"· {_get_link(mid)} <i>(модер)</i>")
+    for yid in YOUTUBER_IDS:
+        if yid not in ADMIN_IDS and yid not in MODERATOR_IDS:
+            staff_lines.append(f"· {_get_link(yid)} <i>(ютубер)</i>")
 
     staff_block = "\n".join(staff_lines) if staff_lines else "—"
 
@@ -1558,32 +1905,38 @@ async def admins_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         my_role, cmd_keys = None, None
 
-    text = "🌙 <b>Night Faceit — Стафф</b>\n━━━━━━━━━━━━━━━━━━━━━━\n\n" + staff_block
+    text = "🌙 <b>Команда Faceit</b>\n━━━━━━━━━━━━━━\n\n" + staff_block
 
     # Стаффу дополнительно показываем их роль и описание каждой команды
     if is_moderator(uid) and my_role and cmd_keys:
         cmds_block = "\n".join(CMD_DESCRIPTIONS[k] for k in cmd_keys)
         text += (
-            f"\n\n━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"\n\n━━━━━━━━━━━━━━\n"
             f"<i>Твоя роль: {my_role}</i>\n\n"
             f"{cmds_block}\n\n"
             f"{DURATION_NOTE}"
         )
 
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+    return text
+
+
+async def admins_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /admins — список доступных команд по роли + состав стаффа"""
+    if await dm_buttons_only(update): return
+    await update.message.reply_text(build_admins_text(update.effective_user.id), parse_mode=ParseMode.HTML)
 
 
 
 RULES_TEXT = (
     "🌙 <b>ПРАВИЛА NIGHT FACEIT</b>\n"
-    "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    "━━━━━━━━━━━━━━\n\n"
     "<b>👤 РЕГИСТРАЦИЯ</b>\n"
     "Без регистрации — в матч не попасть.\n"
     "Команда: /reg GAME_ID Никнейм Платформа\n"
     "├ ПК: /reg 6888 Londyyy pc\n"
     "└ Моб: /reg 6888 Londyyy mobile\n"
     "⚠️ Чужой ID или неверная платформа — <b>бан</b>.\n\n"
-    "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    "━━━━━━━━━━━━━━\n\n"
     "<b>📊 ЭЛО И УРОВНИ</b>\n"
     "Старт: 1000 ЭЛО | Минимум: 100 ЭЛО\n\n"
     "💻 ПК — победа <b>+15</b> / поражение <b>−30</b>\n"
@@ -1598,7 +1951,7 @@ RULES_TEXT = (
     "🔴 LVL 8 → 1531 – 1750\n"
     "🔴 LVL 9 → 1751 – 2000\n"
     "🏆 LVL 10 → 2001+\n\n"
-    "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    "━━━━━━━━━━━━━━\n\n"
     "<b>🗣️ ПОВЕДЕНИЕ В ЧАТЕ</b>\n"
     "Бот следит за оскорблениями автоматически.\n"
     "Плохое слово = сообщение удаляется мгновенно.\n\n"
@@ -1611,13 +1964,13 @@ RULES_TEXT = (
     "├ Угрозы, травля, преследование\n"
     "├ Спам, флуд, реклама\n"
     "└ Политика и разжигание конфликтов\n\n"
-    "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    "━━━━━━━━━━━━━━\n\n"
     "<b>🎮 ПРАВИЛА МАТЧЕЙ</b>\n"
     "├ Лив из матча = наказание в виде бана\n"
     "├ Код лобби — сразу в чат после создания\n"
     "├ Результат — скрин в тему «Результаты игр» с номером матча\n"
     "└ Без скрина ЭЛО не начисляется\n\n"
-    "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    "━━━━━━━━━━━━━━\n\n"
     "<b>🚨 ЧИТЕРСТВО</b>\n"
     "Запрещено абсолютно всё:\n"
     "├ Читы, аимботы, ESP, моды с преимуществом\n"
@@ -1626,7 +1979,7 @@ RULES_TEXT = (
     "└ Ложная платформа ради большего ЭЛО\n\n"
     "☠️ Наказание — <b>перманентный бан без апелляций.</b>\n"
     "Жалоба на читера — в личку админу с доказательствами.\n\n"
-    "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    "━━━━━━━━━━━━━━\n\n"
     "<b>👑 АДМИНИСТРАЦИЯ</b>\n"
     "👑 Создатель\n"
     "🛡 Админ\n"
@@ -1634,14 +1987,24 @@ RULES_TEXT = (
     "Споры с администрацией в общем чате — запрещены.\n"
     "Вопрос или жалоба — напишите боту в ЛС команду /ticket, "
     "опишите ситуацию, и администрация ответит прямо здесь.\n\n"
-    "━━━━━━━━━━━━━━━━━━━━━━\n"
+    "━━━━━━━━━━━━━━\n"
     "<i>Незнание правил не освобождает от ответственности.\n"
     "Играем честно — Night Faceit 🌙</i>"
+)
+
+SEASON_TEXT = (
+    f"✨ <b>{SEASON_NAME}</b>\n\n"
+    "Добро пожаловать в первый тестовый сезон Night Faceit.\n"
+    f"{SEASON_NAME} — это запуск обновлённой соревновательной системы, "
+    "механики ELO и лобби 5v5/2v2.\n\n"
+    "Каждый матч влияет на твою позицию в топе.\n\n"
+    f"✨ <i>Сезон заканчивается {SEASON_END}</i>"
 )
 
 
 async def rules_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /rules — правила чата"""
+    if await dm_buttons_only(update): return
     await update.message.reply_text(RULES_TEXT, parse_mode=ParseMode.HTML)
 
 
@@ -1803,6 +2166,81 @@ async def ticket_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     err = await _send_to_tickets_topic(context, intro)
     if err:
         print(f"[ticket] не удалось уведомить админ-конфу: {err}")
+
+
+async def reg_dm_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Ловит текстовое сообщение в ЛС, когда пользователь находится в процессе
+    кнопочной регистрации (после выбора платформы). Ожидаемый формат:
+    "GAME_ID Никнейм". Если пользователь не в процессе регистрации — не
+    трогает сообщение, чтобы его мог обработать следующий обработчик (тикеты).
+    """
+    msg = update.message
+    if not msg or not msg.text:
+        return
+    uid = update.effective_user.id
+    platform = context.user_data.get("reg_platform")
+    if not platform:
+        return  # не в процессе регистрации — пропускаем дальше
+
+    if is_registered(uid):
+        context.user_data.pop("reg_platform", None)
+        return
+
+    parts = msg.text.strip().split(maxsplit=1)
+    if len(parts) < 2:
+        await msg.reply_text(
+            "🚫 Отправь ID и никнейм одним сообщением, через пробел:\n"
+            "<code>6888 Londyyy</code>",
+            parse_mode=ParseMode.HTML
+        )
+        raise ApplicationHandlerStop()
+
+    game_id, nickname = parts[0].strip(), parts[1].strip()
+
+    if not game_id.isdigit():
+        await msg.reply_text(
+            "🚫 <b>GAME ID должен содержать только цифры!</b>\n\n"
+            "Пример: <code>6888 Londyyy</code>",
+            parse_mode=ParseMode.HTML
+        )
+        raise ApplicationHandlerStop()
+
+    if len(nickname) > 32:
+        await msg.reply_text("🚫 Никнейм слишком длинный (максимум 32 символа). Попробуй ещё раз.")
+        raise ApplicationHandlerStop()
+
+    db = load_db()
+    for d in db["players"].values():
+        if d.get("external_id") == game_id and not d.get("is_bot"):
+            await msg.reply_text("🚫 Этот GAME ID уже зарегистрирован. Проверь ID и попробуй снова.")
+            raise ApplicationHandlerStop()
+
+    player_data = asdict(Player(uid, nickname, game_id))
+    player_data["platform"] = platform
+    db["players"][str(uid)] = player_data
+    save_db(db)
+    context.user_data.pop("reg_platform", None)
+
+    platform_label = "📱 Мобильный" if platform == "mobile" else "🖥 ПК"
+    win_d, loss_d  = elo_deltas_for(platform)
+
+    await msg.reply_text(
+        f"✅ <b>Зарегистрирован!</b>\n\n"
+        f"👤 Никнейм: <b>{nickname}</b>\n"
+        f"🆔 GAME ID: <code>{game_id}</code>\n"
+        f"🎮 Платформа: <b>{platform_label}</b>\n"
+        f"📊 ELO за победу: <b>+{win_d}</b> | за поражение: <b>-{loss_d}</b>\n\n"
+        f"🔍 Найти матч можно только в беседе.\n\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"⚠️ <b>За обман платформы вы получаете бан от администрации Faceit!</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("➡️ Перейти в беседу", url=BESEDA_LINK)],
+            [InlineKeyboardButton("⬅️ В главное меню", callback_data="cmd_menu")],
+        ])
+    )
+    raise ApplicationHandlerStop()
 
 
 async def ticket_dm_forward_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1968,6 +2406,18 @@ async def tickets_list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ════════════════════════════════════════════════
 
 
+async def _menu_edit(q, text: str, kb: Optional[InlineKeyboardMarkup] = None) -> None:
+    """Редактирует текущее сообщение бота вместо отправки нового —
+    чтобы кнопки меню не спамили чат новыми сообщениями."""
+    try:
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    except Exception:
+        try:
+            await q.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        except Exception:
+            pass
+
+
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q   = update.callback_query
     uid = q.from_user.id
@@ -1983,6 +2433,224 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if check_muted(uid):
             await q.answer("🔇 Вы в муте — любые действия запрещены!", show_alert=True)
             return
+
+    # ── ГЛАВНОЕ МЕНЮ (ЛС) ────────────────────────────────────────────────────
+    if cb == "cmd_menu":
+        await q.answer()
+        db  = load_db()
+        s   = str(uid)
+        reg = bool(s in db["players"] and db["players"][s].get("external_id"))
+        name = q.from_user.first_name or "игрок"
+        text = (
+            f"👋 <b>Привет, {name}!</b>\n\n"
+            f"🌙 <b>Night Faceit</b> — твоя персональная лига\n\n"
+            f"{'✅ Ты зарегистрирован' if reg else '❌ Ты не зарегистрирован'}\n\n"
+            f"👇 Выбери действие:"
+        )
+        await _menu_edit(q, text, main_menu_kb(uid, reg))
+        return
+
+    # ── НАЙТИ МАТЧ (из ЛС — с предупреждением) ──────────────────────────────
+    if cb == "cmd_play":
+        await q.answer()
+        if not is_registered(uid) and uid not in ADMIN_IDS:
+            await _menu_edit(
+                q,
+                "❌ <b>Вы не зарегистрированы!</b>\n\n"
+                "Нажмите «📝 Регистрация» в главном меню.",
+                InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ В главное меню", callback_data="cmd_menu")]])
+            )
+            return
+        await _menu_edit(
+            q,
+            DM_LOBBY_WARNING + "\n\nВыбери режим:",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("🎮 Лобби 5v5", callback_data="dm_lobby_5v5")],
+                [InlineKeyboardButton("⚡ Лобби 2v2", callback_data="dm_lobby_2v2")],
+                [InlineKeyboardButton("➡️ Перейти в беседу", url=BESEDA_LINK)],
+                [InlineKeyboardButton("⬅️ В главное меню", callback_data="cmd_menu")],
+            ])
+        )
+        return
+
+    # ── ЛОББИ ИЗ ЛС: показываем текущую очередь, кнопки join_/leave_ уже общие ──
+    if cb in ("dm_lobby_5v5", "dm_lobby_2v2"):
+        await q.answer()
+        mode = cb.split("_")[-1]
+        db   = load_db()
+        q_list = db.get(f"queue_{mode}", [])
+        try:
+            await q.edit_message_text(
+                lobby_text(mode, q_list),
+                reply_markup=lobby_kb(mode, uid, q_list),
+                parse_mode=ParseMode.HTML
+            )
+        except Exception:
+            pass
+        return
+
+    # ── МОЙ ПРОФИЛЬ ───────────────────────────────────────────────────────────
+    if cb == "cmd_stats":
+        await q.answer()
+        private_chat = bool(q.message and q.message.chat.type == "private")
+        text, kb = build_stats_text(uid, True, private_chat)
+        rows = list(kb.inline_keyboard) if kb else []
+        rows.append([InlineKeyboardButton("⬅️ В главное меню", callback_data="cmd_menu")])
+        await _menu_edit(q, text, InlineKeyboardMarkup(rows))
+        return
+
+    # ── ТОП ИГРОКОВ ───────────────────────────────────────────────────────────
+    if cb == "cmd_top":
+        await q.answer()
+        await _menu_edit(
+            q, build_top_text(),
+            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ В главное меню", callback_data="cmd_menu")]])
+        )
+        return
+
+    # ── СЕЗОН ─────────────────────────────────────────────────────────────────
+    if cb == "cmd_season":
+        await q.answer()
+        await _menu_edit(
+            q, SEASON_TEXT,
+            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ В главное меню", callback_data="cmd_menu")]])
+        )
+        return
+
+    # ── ПРАВИЛА ───────────────────────────────────────────────────────────────
+    if cb == "cmd_rules":
+        await q.answer()
+        await _menu_edit(
+            q, RULES_TEXT,
+            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ В главное меню", callback_data="cmd_menu")]])
+        )
+        return
+
+    # ── КОМАНДЫ СТАФФА ────────────────────────────────────────────────────────
+    if cb == "cmd_admins":
+        await q.answer()
+        await _menu_edit(
+            q, build_admins_text(uid),
+            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ В главное меню", callback_data="cmd_menu")]])
+        )
+        return
+
+    # ── ПОДДЕРЖКА (открыть тикет прямо из меню) ─────────────────────────────
+    if cb == "cmd_support":
+        await q.answer()
+        if check_banned(uid):
+            await _menu_edit(
+                q, "🚫 Вы забанены и не можете создавать тикеты.",
+                InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ В главное меню", callback_data="cmd_menu")]])
+            )
+            return
+        db  = load_db()
+        tid = db.get("user_open_ticket", {}).get(str(uid))
+        ticket = db.get("tickets", {}).get(tid) if tid else None
+        if ticket and ticket.get("status") == "open":
+            await _menu_edit(
+                q,
+                f"🎫 У вас уже открыт тикет <b>#{tid}</b>.\n"
+                f"Просто напишите сообщение сюда — оно уйдёт администрации.\n"
+                f"Закрыть тикет: /closeticket",
+                InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ В главное меню", callback_data="cmd_menu")]])
+            )
+            return
+        p    = get_player(uid, q.from_user.first_name or "Игрок")
+        nick = p.nickname if is_registered(uid) else (q.from_user.first_name or "Игрок")
+        db["ticket_counter"] = db.get("ticket_counter", 0) + 1
+        tid = str(db["ticket_counter"])
+        db.setdefault("tickets", {})[tid] = {
+            "user_id": uid, "nickname": nick, "status": "open",
+            "created_ts": datetime.now().timestamp(),
+        }
+        db.setdefault("user_open_ticket", {})[str(uid)] = tid
+        save_db(db)
+        await _menu_edit(
+            q,
+            f"🎫 <b>Тикет #{tid} открыт.</b>\n\n"
+            f"Опишите проблему — каждое следующее сообщение (текст или фото) "
+            f"будет передано администрации.\n"
+            f"Закрыть тикет: /closeticket",
+            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ В главное меню", callback_data="cmd_menu")]])
+        )
+        intro = (
+            f"🎫 <b>Новый тикет #{tid}</b>\n"
+            f"👤 <a href=\"tg://user?id={uid}\">{nick}</a> (<code>{uid}</code>)"
+        )
+        err = await _send_to_tickets_topic(context, intro)
+        if err:
+            print(f"[ticket] не удалось уведомить админ-конфу: {err}")
+        return
+
+    # ── РЕГИСТРАЦИЯ: сначала подписка на беседу ─────────────────────────────
+    if cb == "cmd_reg":
+        await q.answer()
+        if is_registered(uid):
+            await _menu_edit(
+                q, "🚫 Вы уже зарегистрированы.\nДля смены данных обратитесь к администратору.",
+                InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ В главное меню", callback_data="cmd_menu")]])
+            )
+            return
+        if await is_subscribed_beseda(context.bot, uid):
+            await _menu_edit(
+                q, "📝 <b>Регистрация</b>\n\nВыбери свою платформу:",
+                InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🖥 ПК", callback_data="reg_platform_pc"),
+                     InlineKeyboardButton("📱 Мобильный", callback_data="reg_platform_mobile")],
+                    [InlineKeyboardButton("⬅️ В главное меню", callback_data="cmd_menu")],
+                ])
+            )
+        else:
+            await _menu_edit(
+                q,
+                "🔒 <b>Доступ ограничен</b>\n\n"
+                "Для регистрации сначала подпишись на нашу беседу — там играются матчи.",
+                _sub_gate_kb()
+            )
+        return
+
+    if cb == "reg_check_sub":
+        if is_registered(uid):
+            await q.answer("Вы уже зарегистрированы", show_alert=True)
+            return
+        if await is_subscribed_beseda(context.bot, uid):
+            await q.answer("✅ Подписка подтверждена!")
+            await _menu_edit(
+                q, "📝 <b>Регистрация</b>\n\nВыбери свою платформу:",
+                InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🖥 ПК", callback_data="reg_platform_pc"),
+                     InlineKeyboardButton("📱 Мобильный", callback_data="reg_platform_mobile")],
+                    [InlineKeyboardButton("⬅️ В главное меню", callback_data="cmd_menu")],
+                ])
+            )
+        else:
+            await q.answer("❌ Вы ещё не подписались на беседу!", show_alert=True)
+        return
+
+    if cb in ("reg_platform_pc", "reg_platform_mobile"):
+        if is_registered(uid):
+            await q.answer("Вы уже зарегистрированы", show_alert=True)
+            return
+        if not await is_subscribed_beseda(context.bot, uid):
+            await q.answer("❌ Сначала подпишись на беседу!", show_alert=True)
+            await _menu_edit(
+                q, "🔒 <b>Доступ ограничен</b>\n\nСначала подпишись на беседу.",
+                _sub_gate_kb()
+            )
+            return
+        await q.answer()
+        platform = "pc" if cb == "reg_platform_pc" else "mobile"
+        context.user_data["reg_platform"] = platform
+        platform_label = "🖥 ПК" if platform == "pc" else "📱 Мобильный"
+        await _menu_edit(
+            q,
+            f"✅ Платформа: <b>{platform_label}</b>\n\n"
+            f"Теперь отправь одним сообщением твой <b>игровой ID</b> и <b>никнейм</b>:\n"
+            f"<code>6888 Londyyy</code>",
+            None
+        )
+        return
 
     # ── TOP 2v2 ───────────────────────────────────────────────────────────────
     if cb == "top_2v2":
@@ -2010,7 +2678,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         players.sort(key=lambda p: p.elo_2v2, reverse=True)
         medals = ["🥇","🥈","🥉","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
-        lines  = ["⚡ <b>Топ-10 игроков — 2v2</b>\n━━━━━━━━━━━━━━━"]
+        lines  = ["⚡ <b>Топ-10 игроков — 2v2</b>\n━━━━━━━━━━━━━━"]
         for i, p in enumerate(players[:10]):
             wr = f"{p.avg_2v2:.1f}%" if (p.wins_2v2+p.losses_2v2) else "—"
             lines.append(
@@ -2069,6 +2737,40 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             queue.remove(uid)
             await q.answer(f"❌ Вы вышли из очереди {mode.upper()}")
 
+            db[key] = queue
+            save_db(db)
+
+            # ── Выход из лобби в ЛС — сразу кидаем в главное меню ──
+            if q.message and q.message.chat.type == "private":
+                s    = str(uid)
+                reg  = bool(s in db["players"] and db["players"][s].get("external_id"))
+                name = q.from_user.first_name or "игрок"
+                menu_text = (
+                    f"👋 <b>Привет, {name}!</b>\n\n"
+                    f"🌙 <b>Night Faceit</b> — твоя персональная лига\n\n"
+                    f"{'✅ Ты зарегистрирован' if reg else '❌ Ты не зарегистрирован'}\n\n"
+                    f"👇 Выбери действие:"
+                )
+                try:
+                    await q.edit_message_text(
+                        menu_text,
+                        reply_markup=main_menu_kb(uid, reg),
+                        parse_mode=ParseMode.HTML
+                    )
+                except Exception:
+                    pass
+                return
+
+            try:
+                await q.edit_message_text(
+                    lobby_text(mode, queue),
+                    reply_markup=lobby_kb(mode, uid, queue),
+                    parse_mode=ParseMode.HTML
+                )
+            except Exception:
+                pass
+            return
+
         db[key] = queue
         save_db(db)
 
@@ -2084,8 +2786,16 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(queue) >= size:
             match_players = queue[:size]
             db[key]       = queue[size:]
-            lobby_info    = db.get(f"lobby_{mode}", {})
-            lobby_chat    = lobby_info.get("chat_id") or q.message.chat_id
+            lobby_info   = db.get(f"lobby_{mode}", {})
+            # Если лобби никто не открывал в беседе (например все зашли из ЛС),
+            # матч всё равно стартует в беседе платформы, а не в личке —
+            # там же потом принимаются скрины результатов (game scrin).
+            if lobby_info.get("chat_id"):
+                lobby_chat = lobby_info["chat_id"]
+            elif q.message.chat.type != "private":
+                lobby_chat = q.message.chat_id
+            else:
+                lobby_chat = BESEDA_USERNAME
             lobby_thread  = lobby_info.get("thread_id")
             save_db(db)
             try:
@@ -2162,10 +2872,50 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if _is_bot_uid(m["turn"]):
                 await _bot_auto_pick(m_id, context, m.get("chat_id", q.message.chat_id))
         else:
-            # Пик завершён — карта одна (Seaside), бан не нужен
+            # Пик игроков завершён
             task = _pick_timer_tasks.pop(m_id, None)
             if task:
                 task.cancel()
+
+            chat_id_for_banner = m.get("chat_id", q.message.chat_id)
+            thread_id_for_banner = m.get("thread_id")
+
+            if len(m["maps"]) > 1:
+                # Карт больше одной — начинаем бан карт. Первым банит CT-капитан.
+                m["phase"] = "ban"
+                m["turn"] = ct_cap
+                m["ban_start_time"] = time.time()
+                try:
+                    await q.edit_message_text(
+                        f"✅ <b>Пик игроков завершён | Матч #{m_id}</b>",
+                        parse_mode=ParseMode.HTML
+                    )
+                except Exception:
+                    pass
+                save_db(db)
+                ban_btns = [
+                    [InlineKeyboardButton(f"🚫 {mn}", callback_data=f"bn_{m_id}_{mn}")]
+                    for mn in m["maps"]
+                ]
+                ban_txt = _ban_status_text(m_id, m, m.get("ban_timeout", BAN_TIMEOUT))
+                try:
+                    sent = await context.bot.send_message(
+                        chat_id=chat_id_for_banner, message_thread_id=thread_id_for_banner,
+                        text=ban_txt,
+                        reply_markup=InlineKeyboardMarkup(ban_btns),
+                        parse_mode=ParseMode.HTML
+                    )
+                    m["ban_msg_id"] = sent.message_id
+                    save_db(db)
+                except Exception:
+                    pass
+                ban_task = asyncio.create_task(_ban_timer(m_id, context, chat_id_for_banner))
+                _ban_timer_tasks[m_id] = ban_task
+                if _is_bot_uid(m["turn"]):
+                    await _bot_auto_ban(m_id, context, chat_id_for_banner, thread_id_for_banner)
+                return
+
+            # Карта одна — бан не нужен, сразу объявляем лобби
             host_uid  = m.get("host_uid", ct_cap)
             host_p    = get_player(host_uid)
             host_side = "🔵 CT" if host_uid == ct_cap else "🔴 T"
@@ -2179,8 +2929,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
             save_db(db)
-            chat_id_for_banner = m.get("chat_id", q.message.chat_id)
-            thread_id_for_banner = m.get("thread_id")
             await _announce_lobby_ready(
                 context, chat_id_for_banner, thread_id_for_banner,
                 m_id, m, host_p, host_side, final_map
@@ -2771,6 +3519,7 @@ async def win_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elo_snapshot[s_snap] = win_d_s if uid in winners else loss_d_s
     db.setdefault("finished_matches", {})[m_id] = {
         "mode":         mode,
+        "map":          m["maps"][0] if m.get("maps") else None,
         "winners":      winners,
         "losers":       losers,
         "kd_by_uid":    kd_snapshot,
@@ -3171,7 +3920,7 @@ async def elo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Нет зарегистрированных игроков."); return
 
     rows.sort(key=lambda x: x[2], reverse=True)
-    lines = ["📊 <b>ELO таблица (5v5)</b>\n━━━━━━━━━━━━━━━━━━━━━"]
+    lines = ["📊 <b>ELO таблица (5v5)</b>\n━━━━━━━━━━━━━━"]
     for i, (nick, ext_id, elo, wr, games, icon) in enumerate(rows[:30], 1):
         lines.append(
             f"{i:2}. {icon} {nick} <code>[{ext_id}]</code>\n"
@@ -3627,6 +4376,7 @@ async def api_match_history(request):
         rows.append({
             "match_id":    m_id,
             "mode":        m.get("mode", "5v5"),
+            "map":         m.get("map"),
             "won":         won,
             "kills":       kd[0] if len(kd) > 0 else 0,
             "deaths":      kd[1] if len(kd) > 1 else 0,
@@ -3676,6 +4426,7 @@ async def api_match_details(request):
     data = {
         "match_id":    m_id,
         "mode":        m.get("mode", "5v5"),
+        "map":         m.get("map"),
         "finished_ts": m.get("finished_ts", 0),
         "teams": [
             _team(m.get("winners", []), True),
@@ -3745,7 +4496,16 @@ async def set_commands(app: Application):
     _app_ref = app
     await _restore_db_from_telegram(app.bot)
     await _reschedule_punishment_expiries(app.bot)
-    await app.bot.set_my_commands([
+
+    # ── ЛС: в списке команд (по "/") виден только /start — всё остальное
+    # делается через кнопки меню.
+    await app.bot.set_my_commands(
+        [BotCommand("start", "Главное меню")],
+        scope=BotCommandScopeAllPrivateChats()
+    )
+
+    # ── Беседа/группы: полный список команд, как раньше.
+    group_commands = [
         BotCommand("start",   "Главное меню"),
         BotCommand("reg",     "Регистрация"),
         BotCommand("platform","Выбор платформы ПК/мобила"),
@@ -3756,7 +4516,11 @@ async def set_commands(app: Application):
         BotCommand("ticket",  "Написать в поддержку"),
         BotCommand("admins",  "Команды по ролям"),
         BotCommand("rules",   "Правила чата"),
-    ])
+    ]
+    await app.bot.set_my_commands(group_commands, scope=BotCommandScopeAllGroupChats())
+    # Дефолтный scope — на случай супергрупп/каналов, не покрытых явными scope'ами.
+    await app.bot.set_my_commands(group_commands, scope=BotCommandScopeDefault())
+
     if WEBAPP_URL:
         await app.bot.set_chat_menu_button(
             menu_button=MenuButtonWebApp(
@@ -3825,6 +4589,13 @@ async def run_bot():
     # (только групповые чаты — личка сюда не попадает, см. ChatType.GROUPS).
     app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.GROUPS, scoreboard_photo_handler))
     app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.GROUPS, message_filter_handler))
+
+    # Обработчик кнопочной регистрации в ЛС: ловит "ID Никнейм" после выбора
+    # платформы, до того как сообщение попадёт в транслятор тикетов.
+    app.add_handler(MessageHandler(
+        filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND,
+        reg_dm_text_handler,
+    ), group=-1)
 
     # Транслятор тикетов: НЕ-командные текст/фото в личке боту —
     # пересылаются в тему "Тикеты" админ-конфы, если у игрока открыт тикет.
