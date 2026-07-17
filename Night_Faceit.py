@@ -113,6 +113,19 @@ BOT_ID_START = -100000
 # калибровки, а сам игрок не попадает в /top.
 CALIBRATION_MATCHES = 5
 
+# Пока игрок калибруется, ELO НЕ меняется фикс. дельтами (+15/-30 и т.д.) —
+# оно вообще не трогается матч за матчем. Как только он отыгрывает
+# CALIBRATION_MATCHES матчей, бот САМ считает ему стартовый ELO по
+# фактической статистике этих матчей (винрейт + общий KD), а не просто
+# продолжает от дефолтных 1000. Дальше уже работает обычная система
+# +/- ELO за победу/поражение (elo_deltas_for) от этой стартовой точки.
+CALIB_BASE_ELO       = 1000   # средняя точка (примерно LVL5) — как если бы игрок сыграл 50/50 с KD 1.0
+CALIB_ELO_SPREAD     = 700    # максимальное отклонение от базы в +/- сторону при идеальной/провальной калибровке
+CALIB_WINRATE_WEIGHT = 0.6    # вес винрейта в итоговой формуле (0..1)
+CALIB_KD_WEIGHT      = 0.4    # вес общего KD в итоговой формуле (0..1)
+CALIB_ELO_FLOOR      = 100    # нижняя граница итогового калибровочного ELO
+CALIB_ELO_CEIL       = 2500   # верхняя граница итогового калибровочного ELO
+
 
 def matches_played_of(wins: int, losses: int) -> int:
     return max(0, int(wins) + int(losses))
@@ -120,6 +133,33 @@ def matches_played_of(wins: int, losses: int) -> int:
 
 def is_calibrated(wins: int, losses: int) -> bool:
     return matches_played_of(wins, losses) >= CALIBRATION_MATCHES
+
+
+def calibrated_elo_for(wins: int, losses: int, kills: int, deaths: int) -> int:
+    """
+    Считает "реальный" стартовый ELO по итогам калибровочных матчей.
+
+    Вместо того чтобы всем выдавать одинаковые 1000 и одинаковую дельту,
+    бот смотрит на факт. результат калибровки:
+      • винрейт  — сколько из CALIBRATION_MATCHES матчей игрок выиграл;
+      • общий KD — total_kills / total_deaths за эти же матчи.
+
+    Обе метрики нормализуются в диапазон -1..+1 (0 — «средний» результат:
+    50% побед и KD 1.0), взвешиваются (CALIB_*_WEIGHT) и переводятся в
+    отклонение от CALIB_BASE_ELO в пределах +/- CALIB_ELO_SPREAD.
+    Игрок, стабильно побеждавший с высоким KD, сразу попадёт в высокий
+    LVL; отыгравший калибровку в минус — в низкий, как и должно быть.
+    """
+    matches = max(1, int(wins) + int(losses))
+    win_rate = wins / matches                        # 0..1
+    kd = (kills / deaths) if deaths else float(kills) # общий KD за калибровку
+
+    wr_norm = (win_rate - 0.5) * 2                          # -1..+1
+    kd_norm = max(-1.0, min(1.0, (kd - 1.0) / 2.0))          # KD 0 → -1, KD 1 → 0, KD 3+ → +1
+
+    performance = wr_norm * CALIB_WINRATE_WEIGHT + kd_norm * CALIB_KD_WEIGHT
+    elo = CALIB_BASE_ELO + performance * CALIB_ELO_SPREAD
+    return max(CALIB_ELO_FLOOR, min(CALIB_ELO_CEIL, round(elo)))
 
 
 def elo_deltas_for(platform: str) -> tuple:
@@ -3774,6 +3814,12 @@ async def win_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     win_lines:  List[str] = []
     loss_lines: List[str] = []
 
+    # Полный снапшот состояния каждого игрока ДО этого матча — нужен для
+    # точного отката в /cancelwin (особенно важно на переходе через
+    # калибровку, когда ELO не просто прибавляется/убавляется дельтой,
+    # а пересчитывается целиком).
+    before_snapshot: Dict[str, dict] = {}
+
     def _apply(target_uid: int, won: bool, lines: List[str]) -> None:
         if _is_bot_uid(target_uid):
             return
@@ -3782,19 +3828,29 @@ async def win_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not pdata:
             return
 
-        platform      = pdata.get("platform", "pc")
-        win_d, loss_d = elo_deltas_for(platform)
-        delta         = win_d if won else -loss_d
+        before_snapshot[s] = {
+            "elo":            pdata.get("elo", 1000),
+            f"elo_{mode}":    pdata.get(f"elo_{mode}", 1000),
+            "wins":           pdata.get("wins", 0),
+            "losses":         pdata.get("losses", 0),
+            f"wins_{mode}":   pdata.get(f"wins_{mode}", 0),
+            f"losses_{mode}": pdata.get(f"losses_{mode}", 0),
+            "avg":            pdata.get("avg", 0.0),
+            f"avg_{mode}":    pdata.get(f"avg_{mode}", 0.0),
+            "total_kills":    pdata.get("total_kills", 0),
+            "total_deaths":   pdata.get("total_deaths", 0),
+        }
 
-        for field in ("elo", f"elo_{mode}"):
-            pdata[field] = max(ELO_MIN, pdata.get(field, 1000) + delta)
+        was_calibrated = is_calibrated(pdata.get("wins", 0), pdata.get("losses", 0))
+        platform       = pdata.get("platform", "pc")
+        win_d, loss_d  = elo_deltas_for(platform)
 
         if won:
-            pdata["wins"]            = pdata.get("wins", 0) + 1
-            pdata[f"wins_{mode}"]    = pdata.get(f"wins_{mode}", 0) + 1
+            pdata["wins"]           = pdata.get("wins", 0) + 1
+            pdata[f"wins_{mode}"]   = pdata.get(f"wins_{mode}", 0) + 1
         else:
-            pdata["losses"]          = pdata.get("losses", 0) + 1
-            pdata[f"losses_{mode}"]  = pdata.get(f"losses_{mode}", 0) + 1
+            pdata["losses"]         = pdata.get("losses", 0) + 1
+            pdata[f"losses_{mode}"] = pdata.get(f"losses_{mode}", 0) + 1
 
         w, l   = pdata.get("wins", 0), pdata.get("losses", 0)
         wm, lm = pdata.get(f"wins_{mode}", 0), pdata.get(f"losses_{mode}", 0)
@@ -3807,11 +3863,31 @@ async def win_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pdata["total_deaths"] = pdata.get("total_deaths", 0) + deaths
         total_kd = round(pdata["total_kills"] / pdata["total_deaths"], 2) if pdata["total_deaths"] else float(pdata["total_kills"])
 
+        now_calibrated = is_calibrated(w, l)
+
+        if not was_calibrated and now_calibrated:
+            # ── Калибровка только что завершилась: считаем реальный ELO по
+            # накопленным винрейту и KD за все калибровочные матчи, а не
+            # продолжаем от одинаковых для всех дефолтных 1000.
+            calib_elo             = calibrated_elo_for(w, l, pdata["total_kills"], pdata["total_deaths"])
+            pdata["elo"]          = calib_elo
+            pdata[f"elo_{mode}"]  = calib_elo
+            elo_status = f"→ <b>{calib_elo}</b> ELO (калибровка завершена, ранг присвоен)"
+        elif not was_calibrated:
+            # ── Всё ещё калибруется — ELO не трогаем, только копим статистику.
+            left = CALIBRATION_MATCHES - matches_played_of(w, l)
+            elo_status = f"(калибровка {matches_played_of(w, l)}/{CALIBRATION_MATCHES}, ELO пока скрыт, ещё {left})"
+        else:
+            delta = win_d if won else -loss_d
+            for field in ("elo", f"elo_{mode}"):
+                pdata[field] = max(ELO_MIN, pdata.get(field, 1000) + delta)
+            sign = "+" if won else "-"
+            applied = win_d if won else loss_d
+            elo_status = f"{sign}{applied} ELO → <b>{pdata['elo']}</b>"
+
         nick = pdata.get("nickname", "?")
-        sign = "+" if won else "-"
-        applied = win_d if won else loss_d
         lines.append(
-            f"  • {nick}: {sign}{applied} ELO → <b>{pdata['elo']}</b> | "
+            f"  • {nick}: {elo_status} | "
             f"{kills}/{deaths} (KD матча {round(kills/deaths, 2) if deaths else kills}) | "
             f"общий KD: <b>{total_kd}</b>"
         )
@@ -3823,21 +3899,24 @@ async def win_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Сохраняем снапшот для возможной отмены (/cancelwin) ─────────────────
     kd_snapshot = {str(uid): list(kd_by_uid.get(uid, (0, 0))) for uid in all_uids}
-    # Сохраняем фактически применённые дельты ELO для точного отката в /cancelwin
-    elo_snapshot: Dict[str, int] = {}
+    # Фактически применённое изменение ELO (со знаком) — для истории матчей
+    # в /api/match_history. Во время калибровки ELO может вообще не измениться
+    # (0), а в момент завершения калибровки — измениться сразу на много.
+    elo_delta_snapshot: Dict[str, int] = {}
     for uid in all_uids:
         s_snap = str(uid)
-        pdata_snap = db["players"].get(s_snap, {})
-        platform_snap = pdata_snap.get("platform", "pc")
-        win_d_s, loss_d_s = elo_deltas_for(platform_snap)
-        elo_snapshot[s_snap] = win_d_s if uid in winners else loss_d_s
+        before = before_snapshot.get(s_snap)
+        if before is None:
+            continue
+        elo_delta_snapshot[s_snap] = db["players"].get(s_snap, {}).get("elo", before.get("elo", 1000)) - before.get("elo", 1000)
     db.setdefault("finished_matches", {})[m_id] = {
-        "mode":         mode,
-        "map":          m["maps"][0] if m.get("maps") else None,
-        "winners":      winners,
-        "losers":       losers,
-        "kd_by_uid":    kd_snapshot,
-        "elo_snapshot": elo_snapshot,
+        "mode":            mode,
+        "map":             m["maps"][0] if m.get("maps") else None,
+        "winners":         winners,
+        "losers":          losers,
+        "kd_by_uid":       kd_snapshot,
+        "before_snapshot": before_snapshot,
+        "elo_delta":       elo_delta_snapshot,
         "finished_ts":  datetime.now().timestamp(),
     }
 
@@ -3896,7 +3975,8 @@ async def cancelwin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     losers   = snapshot.get("losers",  [])
     kd_by_uid_snap = snapshot.get("kd_by_uid", {})  # {str(uid): [kills, deaths]}
 
-    elo_snapshot = snapshot.get("elo_snapshot", {})  # {str(uid): точная дельта из /win}
+    before_snapshot = snapshot.get("before_snapshot", {})      # {str(uid): полное состояние ДО матча}
+    elo_snapshot    = snapshot.get("elo_snapshot", {})         # legacy: {str(uid): точная дельта из старых /win}
 
     lines = []
 
@@ -3908,7 +3988,17 @@ async def cancelwin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not pdata:
             return
 
-        # Берём точную дельту из снапшота; если старый матч без снапшота — считаем по платформе
+        if s in before_snapshot:
+            # ── Новый формат: просто восстанавливаем полный снапшот ДО матча.
+            # Работает корректно и для обычных дельт, и для перехода через
+            # калибровку (когда ELO не дельта, а целиком пересчитанное значение).
+            for field, val in before_snapshot[s].items():
+                pdata[field] = val
+            nick = pdata.get("nickname", "?")
+            lines.append(f"  • {nick}: откат → <b>{pdata.get('elo', 1000)}</b> ELO")
+            return
+
+        # ── Legacy: старые матчи без before_snapshot — считаем по дельте платформы.
         if s in elo_snapshot:
             delta = elo_snapshot[s]
         else:
@@ -4679,14 +4769,18 @@ async def api_match_history(request):
             continue
         won = tg_id in winners
         kd  = m.get("kd_by_uid", {}).get(str(tg_id), [0, 0])
-        elo_delta = m.get("elo_snapshot", {}).get(str(tg_id))
+        elo_delta = m.get("elo_delta", {}).get(str(tg_id))
         if elo_delta is None:
-            # Старые матчи (сыграны до того, как стал сохраняться elo_snapshot)
-            # не хранят точную применённую дельту — считаем её по текущей
-            # формуле начисления ELO, вместо того чтобы показывать +0 ELO.
-            platform_fallback = players.get(str(tg_id), {}).get("platform", "pc")
-            win_d_fb, loss_d_fb = elo_deltas_for(platform_fallback)
-            elo_delta = win_d_fb if won else loss_d_fb
+            legacy_delta = m.get("elo_snapshot", {}).get(str(tg_id))
+            if legacy_delta is not None:
+                # Старый формат хранил только модуль дельты — знак зависел от won/lost.
+                elo_delta = legacy_delta if won else -legacy_delta
+            else:
+                # Совсем старые матчи без какого-либо снапшота ELO — считаем
+                # по текущей формуле начисления, вместо того чтобы показывать +0.
+                platform_fallback = players.get(str(tg_id), {}).get("platform", "pc")
+                win_d_fb, loss_d_fb = elo_deltas_for(platform_fallback)
+                elo_delta = win_d_fb if won else -loss_d_fb
         rows.append({
             "match_id":    m_id,
             "mode":        m.get("mode", "5v5"),
@@ -4694,7 +4788,7 @@ async def api_match_history(request):
             "won":         won,
             "kills":       kd[0] if len(kd) > 0 else 0,
             "deaths":      kd[1] if len(kd) > 1 else 0,
-            "elo_delta":   elo_delta if won else -elo_delta,
+            "elo_delta":   elo_delta,
             "finished_ts": m.get("finished_ts", 0),
             "teammates":   [_nick(u) for u in (winners if won else losers) if u != tg_id],
             "opponents":   [_nick(u) for u in (losers if won else winners)],
