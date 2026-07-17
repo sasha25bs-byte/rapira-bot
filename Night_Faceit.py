@@ -3830,7 +3830,8 @@ async def win_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         before_snapshot[s] = {
             "elo":            pdata.get("elo", 1000),
-            f"elo_{mode}":    pdata.get(f"elo_{mode}", 1000),
+            "elo_5v5":        pdata.get("elo_5v5", 1000),
+            "elo_2v2":        pdata.get("elo_2v2", 1000),
             "wins":           pdata.get("wins", 0),
             "losses":         pdata.get("losses", 0),
             f"wins_{mode}":   pdata.get(f"wins_{mode}", 0),
@@ -3869,9 +3870,14 @@ async def win_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # ── Калибровка только что завершилась: считаем реальный ELO по
             # накопленным винрейту и KD за все калибровочные матчи, а не
             # продолжаем от одинаковых для всех дефолтных 1000.
-            calib_elo             = calibrated_elo_for(w, l, pdata["total_kills"], pdata["total_deaths"])
-            pdata["elo"]          = calib_elo
-            pdata[f"elo_{mode}"]  = calib_elo
+            # ВАЖНО: обновляем ВСЕ поля ELO (общий + elo_5v5 + elo_2v2) одним
+            # значением, а не только поле текущего режима матча — иначе
+            # непройденный режим остаётся на дефолтных 1000 и портит /top
+            # (там берётся max(elo, elo_5v5, elo_2v2)) и карточку профиля.
+            calib_elo            = calibrated_elo_for(w, l, pdata["total_kills"], pdata["total_deaths"])
+            pdata["elo"]         = calib_elo
+            pdata["elo_5v5"]     = calib_elo
+            pdata["elo_2v2"]     = calib_elo
             elo_status = f"→ <b>{calib_elo}</b> ELO (калибровка завершена, ранг присвоен)"
         elif not was_calibrated:
             # ── Всё ещё калибруется — ELO не трогаем, только копим статистику.
