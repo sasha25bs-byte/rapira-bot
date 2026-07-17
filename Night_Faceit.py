@@ -16,6 +16,7 @@ from PIL import Image, ImageDraw, ImageFont
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, MenuButtonWebApp, WebAppInfo,
     ChatPermissions, BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats, BotCommandScopeDefault,
+    InputMediaPhoto,
 )
 from telegram.ext import (
     Application,
@@ -220,15 +221,17 @@ class Player:
         return self._lvl_for(self.elo)
 
     def _lvl_for(self, elo: int) -> str:
-        if elo >= 2001: return "🏆 LVL 10"
+        # Группировка цветов как на оригинальном Faceit: 1-2 серый, 3-5 зелёный,
+        # 6-8 оранжевый, 9-10 красный (10 — макс. уровень).
+        if elo >= 2001: return "🔴 LVL 10"
         if elo >= 1751: return "🔴 LVL 9"
-        if elo >= 1531: return "🔴 LVL 8"
+        if elo >= 1531: return "🟠 LVL 8"
         if elo >= 1351: return "🟠 LVL 7"
         if elo >= 1201: return "🟠 LVL 6"
-        if elo >= 1051: return "🟡 LVL 5"
-        if elo >= 901:  return "🟡 LVL 4"
+        if elo >= 1051: return "🟢 LVL 5"
+        if elo >= 901:  return "🟢 LVL 4"
         if elo >= 751:  return "🟢 LVL 3"
-        if elo >= 501:  return "🟢 LVL 2"
+        if elo >= 501:  return "⚪ LVL 2"
         return "⚪ LVL 1"
 
     def tg_link(self) -> str:
@@ -1520,15 +1523,15 @@ def build_stats_text(target: int, looking_at_self: bool, private_chat: bool = Tr
         role_line = ""
 
     def lvl_icon_for(elo: int) -> str:
-        if elo >= 2001: return "🏆 LVL 10"
+        if elo >= 2001: return "🔴 LVL 10"
         if elo >= 1751: return "🔴 LVL 9"
-        if elo >= 1531: return "🔴 LVL 8"
+        if elo >= 1531: return "🟠 LVL 8"
         if elo >= 1351: return "🟠 LVL 7"
         if elo >= 1201: return "🟠 LVL 6"
-        if elo >= 1051: return "🟡 LVL 5"
-        if elo >= 901:  return "🟡 LVL 4"
+        if elo >= 1051: return "🟢 LVL 5"
+        if elo >= 901:  return "🟢 LVL 4"
         if elo >= 751:  return "🟢 LVL 3"
-        if elo >= 501:  return "🟢 LVL 2"
+        if elo >= 501:  return "⚪ LVL 2"
         return "⚪ LVL 1"
 
     platform_label = "📱 Мобильный" if p.platform == "mobile" else "🖥 ПК"
@@ -1726,21 +1729,37 @@ def _card_draw_logo_icon(d: ImageDraw.ImageDraw, cx: float, cy: float, size: flo
 
 
 def _card_draw_hex(d: ImageDraw.ImageDraw, cx: float, cy: float, size: float, number: int, color, font):
+    """Рисует закрашенный шестиугольный значок уровня — как на оригинальном Faceit
+    (сплошная заливка цветом уровня + белая цифра по центру), а не просто контур с цифрой."""
     pts = [(cx + size * math.cos(math.pi / 6 + i * math.pi / 3),
             cy + size * math.sin(math.pi / 6 + i * math.pi / 3)) for i in range(6)]
-    d.polygon(pts, outline=color, width=3)
+    border = tuple(max(0, int(c * 0.65)) for c in color)
+    d.polygon(pts, fill=color, outline=border, width=2)
     txt = str(number)
-    bbox = d.textbbox((0, 0), txt, font=font)
+    f_num = _card_fit_font(d, txt, size * 1.15, getattr(font, "size", 19), min_size=12)
+    bbox = d.textbbox((0, 0), txt, font=f_num)
     tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    d.text((cx - tw / 2 - bbox[0], cy - th / 2 - bbox[1]), txt, font=font, fill=color)
+    d.text((cx - tw / 2 - bbox[0], cy - th / 2 - bbox[1]), txt, font=f_num, fill=(255, 255, 255))
+
+
+# Палитра уровней как на оригинальном Faceit: 1-2 серый, 3-5 зелёный (от светлого
+# к тёмному), 6-8 оранжевый (от светлого к тёмному), 9-10 красный.
+_LEVEL_COLORS = {
+    1:  (168, 168, 168),
+    2:  (139, 139, 139),
+    3:  (126, 198, 120),
+    4:  (94, 179, 91),
+    5:  (60, 158, 66),
+    6:  (255, 179, 71),
+    7:  (255, 148, 33),
+    8:  (255, 111, 0),
+    9:  (236, 66, 53),
+    10: (214, 28, 28),
+}
 
 
 def _card_level_color(lvl: int):
-    if lvl >= 8:
-        return (255, 104, 0)
-    if lvl >= 4:
-        return (255, 184, 0)
-    return (150, 200, 130)
+    return _LEVEL_COLORS.get(max(1, min(10, int(lvl))), _LEVEL_COLORS[1])
 
 
 def _lvl_number(elo: int) -> int:
@@ -3814,6 +3833,12 @@ async def win_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     win_lines:  List[str] = []
     loss_lines: List[str] = []
 
+    # Игроки, которым после матча нужно прислать PNG-карточку профиля:
+    # те, кто всё ещё калибруется, и те, кто только что прошёл калибровку
+    # (получил свой первый ранг). card_caption — подпись под карточкой.
+    card_uids:    List[int] = []
+    card_caption: Dict[int, str] = {}
+
     # Полный снапшот состояния каждого игрока ДО этого матча — нужен для
     # точного отката в /cancelwin (особенно важно на переходе через
     # калибровку, когда ELO не просто прибавляется/убавляется дельтой,
@@ -3879,10 +3904,22 @@ async def win_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pdata["elo_5v5"]     = calib_elo
             pdata["elo_2v2"]     = calib_elo
             elo_status = f"→ <b>{calib_elo}</b> ELO (калибровка завершена, ранг присвоен)"
+
+            card_uids.append(target_uid)
+            card_caption[target_uid] = (
+                f"🎉 {pdata.get('nickname', '?')} прошёл(ла) калибровку!\n"
+                f"Ранг присвоен: LVL {_lvl_number(calib_elo)} — {calib_elo} ELO"
+            )
         elif not was_calibrated:
             # ── Всё ещё калибруется — ELO не трогаем, только копим статистику.
             left = CALIBRATION_MATCHES - matches_played_of(w, l)
             elo_status = f"(калибровка {matches_played_of(w, l)}/{CALIBRATION_MATCHES}, ELO пока скрыт, ещё {left})"
+
+            card_uids.append(target_uid)
+            card_caption[target_uid] = (
+                f"🌙 {pdata.get('nickname', '?')} — калибровка "
+                f"{matches_played_of(w, l)}/{CALIBRATION_MATCHES}"
+            )
         else:
             delta = win_d if won else -loss_d
             for field in ("elo", f"elo_{mode}"):
@@ -3940,6 +3977,55 @@ async def win_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         + ("\n".join(loss_lines) if loss_lines else "  (нет реальных игроков)")
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+    # ── Карточки профиля тем, кто ещё калибруется или только что прошёл
+    # калибровку. Генерируем PNG (render_stats_card) и шлём в тот же чат:
+    # одной фоткой, если игрок один, альбомом — если несколько.
+    if card_uids:
+        tmp_paths: List[str] = []
+        for cu in card_uids:
+            try:
+                avatar_bytes = await _fetch_avatar_bytes(context.bot, cu)
+                cpath = _os.path.join(
+                    _os.path.dirname(_os.path.abspath(__file__)),
+                    f"_win_card_{m_id}_{cu}.png"
+                )
+                result = render_stats_card(cpath, cu, avatar_bytes)
+                if result:
+                    tmp_paths.append(result)
+            except Exception as e:
+                print(f"⚠️ Не удалось сгенерировать карточку профиля uid={cu}: {e!r}")
+
+        try:
+            if len(tmp_paths) == 1:
+                cu = card_uids[0] if len(card_uids) == 1 else None
+                caption = card_caption.get(cu) if cu is not None else None
+                with open(tmp_paths[0], "rb") as f:
+                    await update.message.reply_photo(photo=f, caption=caption, parse_mode=ParseMode.HTML)
+            elif len(tmp_paths) > 1:
+                opened = [open(p, "rb") for p in tmp_paths]
+                # Сопоставляем открытые файлы с подписями по имени файла
+                # (в нём зашит owner uid) — надёжнее, чем по индексу, т.к.
+                # для части card_uids рендер карточки мог не удаться.
+                media = []
+                for path, f in zip(tmp_paths, opened):
+                    owner_uid = None
+                    for cu in card_uids:
+                        if f"_win_card_{m_id}_{cu}.png" in path:
+                            owner_uid = cu
+                            break
+                    media.append(InputMediaPhoto(f, caption=card_caption.get(owner_uid), parse_mode=ParseMode.HTML))
+                try:
+                    await context.bot.send_media_group(chat_id=update.effective_chat.id, media=media)
+                finally:
+                    for f in opened:
+                        f.close()
+        finally:
+            for p in tmp_paths:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
 
 
 async def cancelwin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
