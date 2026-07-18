@@ -328,11 +328,50 @@ async def _restore_db_from_telegram(bot):
         print(f"⚠️ Не удалось восстановить БД из Telegram: {e}")
 
 
+def _safe_num(d: dict, key: str, default):
+    """Достаёт число из словаря, безопасно подставляя default, если поле
+    отсутствует, равно None или повреждено (не число). Нужно там, где
+    арифметика (например max()) происходит ДО создания Player — там, где
+    .setdefault() не спасает от уже существующих None-значений."""
+    v = d.get(key, default)
+    if not isinstance(v, (int, float)) or isinstance(v, bool):
+        return default
+    return v
+
+
+_PLAYER_NUMERIC_DEFAULTS = {
+    "elo": 1000, "elo_5v5": 1000, "elo_2v2": 1000,
+    "wins": 0, "losses": 0, "wins_5v5": 0, "losses_5v5": 0,
+    "wins_2v2": 0, "losses_2v2": 0,
+    "avg": 0.0, "avg_5v5": 0.0, "avg_2v2": 0.0,
+    "total_kills": 0, "total_deaths": 0,
+}
+_PLAYER_STRING_DEFAULTS = {"external_id": "", "nickname": "?", "platform": "pc"}
+_PLAYER_BOOL_DEFAULTS   = {"is_bot": False}
+
+
 def _make_player(d: dict) -> "Player":
-    """Создаёт Player из словаря, игнорируя неизвестные поля."""
+    """Создаёт Player из словаря, игнорируя неизвестные поля.
+    Дополнительно чистит None/битые значения в числовых, строковых и булевых
+    полях — это защищает /top, /stats и PNG-карточки от падения из-за старых
+    или повреждённых записей в БД (например, elo_5v5=None у игрока, который
+    никогда не играл 5v5). .setdefault() в вызывающем коде НЕ спасает от этого,
+    так как срабатывает только когда ключ отсутствует, а не когда он None."""
     import dataclasses
     known = {f.name for f in dataclasses.fields(Player)}
-    return Player(**{k: v for k, v in d.items() if k in known})
+    clean = {k: v for k, v in d.items() if k in known}
+    for field, default in _PLAYER_NUMERIC_DEFAULTS.items():
+        v = clean.get(field, default)
+        if not isinstance(v, (int, float)) or isinstance(v, bool):
+            v = default
+        clean[field] = v
+    for field, default in _PLAYER_STRING_DEFAULTS.items():
+        v = clean.get(field, default)
+        clean[field] = v if isinstance(v, str) else default
+    for field, default in _PLAYER_BOOL_DEFAULTS.items():
+        v = clean.get(field, default)
+        clean[field] = v if isinstance(v, bool) else default
+    return Player(**clean)
 
 
 def get_player(uid: int, name: str = "Player") -> Player:
@@ -1697,24 +1736,25 @@ def build_top_players(limit: int = 10) -> List[Player]:
     db      = load_db()
     players = []
     for d in db["players"].values():
-        if not d.get("external_id") or d.get("is_bot"): continue
-        for field, val in [("wins", 0), ("losses", 0), ("avg", 0.0), ("elo", 1000),
-                            ("elo_5v5", 1000), ("elo_2v2", 1000),
-                            ("wins_5v5", 0), ("losses_5v5", 0),
-                            ("wins_2v2", 0), ("losses_2v2", 0),
-                            ("avg_5v5", 0.0), ("avg_2v2", 0.0),
-                            ("external_id", ""), ("is_bot", False),
-                            ("total_kills", 0), ("total_deaths", 0),
-                            ("platform", "pc")]:
-            d.setdefault(field, val)
-        d["elo"] = max(d.get("elo", 1000), d.get("elo_5v5", 1000), d.get("elo_2v2", 1000))
         try:
+            if not d.get("external_id") or d.get("is_bot"): continue
+            for field, val in [("wins", 0), ("losses", 0), ("avg", 0.0), ("elo", 1000),
+                                ("elo_5v5", 1000), ("elo_2v2", 1000),
+                                ("wins_5v5", 0), ("losses_5v5", 0),
+                                ("wins_2v2", 0), ("losses_2v2", 0),
+                                ("avg_5v5", 0.0), ("avg_2v2", 0.0),
+                                ("external_id", ""), ("is_bot", False),
+                                ("total_kills", 0), ("total_deaths", 0),
+                                ("platform", "pc")]:
+                d.setdefault(field, val)
+            d["elo"] = max(_safe_num(d, "elo", 1000), _safe_num(d, "elo_5v5", 1000), _safe_num(d, "elo_2v2", 1000))
             p = _make_player(d)
-        except Exception:
+            if not p.is_calibrated:
+                continue
+            players.append(p)
+        except Exception as e:
+            print(f"⚠️ Пропускаю повреждённую запись игрока в /top: {e!r}")
             continue
-        if not p.is_calibrated:
-            continue
-        players.append(p)
     players.sort(key=lambda p: p.elo, reverse=True)
     return players[:limit]
 
@@ -1900,7 +1940,7 @@ def render_stats_card(target: int, out_path: str, group_name: str = "NightFaceit
                         ("total_kills", 0), ("total_deaths", 0),
                         ("platform", "pc")]:
         d_raw.setdefault(field, val)
-    d_raw["elo"] = max(d_raw.get("elo", 1000), d_raw.get("elo_5v5", 1000), d_raw.get("elo_2v2", 1000))
+    d_raw["elo"] = max(_safe_num(d_raw, "elo", 1000), _safe_num(d_raw, "elo_5v5", 1000), _safe_num(d_raw, "elo_2v2", 1000))
 
     try:
         p = _make_player(d_raw)
