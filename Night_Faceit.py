@@ -16,7 +16,6 @@ from PIL import Image, ImageDraw, ImageFont
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, MenuButtonWebApp, WebAppInfo,
     ChatPermissions, BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats, BotCommandScopeDefault,
-    InputMediaPhoto,
 )
 from telegram.ext import (
     Application,
@@ -101,66 +100,18 @@ LOBBY_2V2_SIZE = 4
 PICK_TIMEOUT   = 90
 BAN_TIMEOUT    = 90
 
+# ── КАЛИБРОВКА ────────────────────────────────────
+# Сколько матчей нужно сыграть, прежде чем игроку показывается реальный
+# уровень/ранг. До этого — в /top, /stats и на карточках вместо уровня
+# показывается прогресс калибровки, а сам игрок не попадает в топ.
+CALIBRATION_GAMES = 5
+
 ELO_WIN_PC       = 15
 ELO_LOSS_PC      = 30
 ELO_WIN_MOBILE   = 25
 ELO_LOSS_MOBILE  = 20
 ELO_MIN      = 100
 BOT_ID_START = -100000
-
-# ── КАЛИБРОВКА ────────────────────────────────────────────────────────────
-# Игроку нужно сыграть CALIBRATION_MATCHES матчей, прежде чем он получит
-# свой ранг (уровень). До этого момента вместо LVL показывается прогресс
-# калибровки, а сам игрок не попадает в /top.
-CALIBRATION_MATCHES = 5
-
-# Пока игрок калибруется, ELO НЕ меняется фикс. дельтами (+15/-30 и т.д.) —
-# оно вообще не трогается матч за матчем. Как только он отыгрывает
-# CALIBRATION_MATCHES матчей, бот САМ считает ему стартовый ELO по
-# фактической статистике этих матчей (винрейт + общий KD), а не просто
-# продолжает от дефолтных 1000. Дальше уже работает обычная система
-# +/- ELO за победу/поражение (elo_deltas_for) от этой стартовой точки.
-CALIB_BASE_ELO       = 1000   # средняя точка (примерно LVL5) — как если бы игрок сыграл 50/50 с KD 1.0
-CALIB_ELO_SPREAD     = 700    # максимальное отклонение от базы в +/- сторону при идеальной/провальной калибровке
-CALIB_WINRATE_WEIGHT = 0.6    # вес винрейта в итоговой формуле (0..1)
-CALIB_KD_WEIGHT      = 0.4    # вес общего KD в итоговой формуле (0..1)
-CALIB_ELO_FLOOR      = 100    # нижняя граница итогового калибровочного ELO
-CALIB_ELO_CEIL       = 2500   # верхняя граница итогового калибровочного ELO
-
-
-def matches_played_of(wins: int, losses: int) -> int:
-    return max(0, int(wins) + int(losses))
-
-
-def is_calibrated(wins: int, losses: int) -> bool:
-    return matches_played_of(wins, losses) >= CALIBRATION_MATCHES
-
-
-def calibrated_elo_for(wins: int, losses: int, kills: int, deaths: int) -> int:
-    """
-    Считает "реальный" стартовый ELO по итогам калибровочных матчей.
-
-    Вместо того чтобы всем выдавать одинаковые 1000 и одинаковую дельту,
-    бот смотрит на факт. результат калибровки:
-      • винрейт  — сколько из CALIBRATION_MATCHES матчей игрок выиграл;
-      • общий KD — total_kills / total_deaths за эти же матчи.
-
-    Обе метрики нормализуются в диапазон -1..+1 (0 — «средний» результат:
-    50% побед и KD 1.0), взвешиваются (CALIB_*_WEIGHT) и переводятся в
-    отклонение от CALIB_BASE_ELO в пределах +/- CALIB_ELO_SPREAD.
-    Игрок, стабильно побеждавший с высоким KD, сразу попадёт в высокий
-    LVL; отыгравший калибровку в минус — в низкий, как и должно быть.
-    """
-    matches = max(1, int(wins) + int(losses))
-    win_rate = wins / matches                        # 0..1
-    kd = (kills / deaths) if deaths else float(kills) # общий KD за калибровку
-
-    wr_norm = (win_rate - 0.5) * 2                          # -1..+1
-    kd_norm = max(-1.0, min(1.0, (kd - 1.0) / 2.0))          # KD 0 → -1, KD 1 → 0, KD 3+ → +1
-
-    performance = wr_norm * CALIB_WINRATE_WEIGHT + kd_norm * CALIB_KD_WEIGHT
-    elo = CALIB_BASE_ELO + performance * CALIB_ELO_SPREAD
-    return max(CALIB_ELO_FLOOR, min(CALIB_ELO_CEIL, round(elo)))
 
 
 def elo_deltas_for(platform: str) -> tuple:
@@ -212,38 +163,44 @@ class Player:
     platform:      str   = "pc"   # "pc" или "mobile" — влияет на начисление ELO за /win
 
     def lvl_icon(self) -> str:
+        if not self.is_calibrated:
+            return f"🔄 Калибровка {self.total_games}/{CALIBRATION_GAMES}"
         return self._lvl_for(self.elo)
 
     def lvl_icon_5v5(self) -> str:
+        if not self.is_calibrated:
+            return f"🔄 Калибровка {self.total_games}/{CALIBRATION_GAMES}"
         return self._lvl_for(self.elo)
 
     def lvl_icon_2v2(self) -> str:
+        if not self.is_calibrated:
+            return f"🔄 Калибровка {self.total_games}/{CALIBRATION_GAMES}"
         return self._lvl_for(self.elo)
 
+    @property
+    def total_games(self) -> int:
+        return self.wins + self.losses
+
+    @property
+    def is_calibrated(self) -> bool:
+        return self.total_games >= CALIBRATION_GAMES
+
     def _lvl_for(self, elo: int) -> str:
-        # Группировка цветов как на оригинальном Faceit: 1-2 серый, 3-5 зелёный,
-        # 6-8 оранжевый, 9-10 красный (10 — макс. уровень).
-        if elo >= 2001: return "🔴 LVL 10"
+        if elo >= 2001: return "🏆 LVL 10"
         if elo >= 1751: return "🔴 LVL 9"
-        if elo >= 1531: return "🟠 LVL 8"
+        if elo >= 1531: return "🔴 LVL 8"
         if elo >= 1351: return "🟠 LVL 7"
         if elo >= 1201: return "🟠 LVL 6"
-        if elo >= 1051: return "🟢 LVL 5"
-        if elo >= 901:  return "🟢 LVL 4"
+        if elo >= 1051: return "🟡 LVL 5"
+        if elo >= 901:  return "🟡 LVL 4"
         if elo >= 751:  return "🟢 LVL 3"
-        if elo >= 501:  return "⚪ LVL 2"
+        if elo >= 501:  return "🟢 LVL 2"
         return "⚪ LVL 1"
 
     def tg_link(self) -> str:
         if self.is_bot:
             return f"🤖 <b>{self.nickname}</b>"
         return f'<a href="tg://user?id={self.user_id}">{self.nickname}</a>'
-
-    def matches_played(self) -> int:
-        return matches_played_of(self.wins, self.losses)
-
-    def is_calibrated(self) -> bool:
-        return is_calibrated(self.wins, self.losses)
 
 # ════════════════════════════════════════════════
 #                  БАЗА ДАННЫХ
@@ -794,7 +751,7 @@ async def _bot_auto_pick(m_id: str, context: ContextTypes.DEFAULT_TYPE, chat_id:
             host_uid  = m.get("host_uid", ct_cap)
             host_p    = get_player(host_uid)
             host_side = "🔵 CT" if host_uid == ct_cap else "🔴 T"
-            final_map = m["maps"][0] if m["maps"] else "Dust 2"
+            final_map = m["maps"][0] if m["maps"] else "Seaside"
             m["phase"] = "done"
             save_db(db)
             await _announce_lobby_ready(context, chat_id, thread_id, m_id, m, host_p, host_side, final_map)
@@ -1523,21 +1480,21 @@ def build_stats_text(target: int, looking_at_self: bool, private_chat: bool = Tr
         role_line = ""
 
     def lvl_icon_for(elo: int) -> str:
-        if elo >= 2001: return "🔴 LVL 10"
+        if elo >= 2001: return "🏆 LVL 10"
         if elo >= 1751: return "🔴 LVL 9"
-        if elo >= 1531: return "🟠 LVL 8"
+        if elo >= 1531: return "🔴 LVL 8"
         if elo >= 1351: return "🟠 LVL 7"
         if elo >= 1201: return "🟠 LVL 6"
-        if elo >= 1051: return "🟢 LVL 5"
-        if elo >= 901:  return "🟢 LVL 4"
+        if elo >= 1051: return "🟡 LVL 5"
+        if elo >= 901:  return "🟡 LVL 4"
         if elo >= 751:  return "🟢 LVL 3"
-        if elo >= 501:  return "⚪ LVL 2"
+        if elo >= 501:  return "🟢 LVL 2"
         return "⚪ LVL 1"
 
     platform_label = "📱 Мобильный" if p.platform == "mobile" else "🖥 ПК"
     kd_label = f"{round(p.total_kills / p.total_deaths, 2)}" if p.total_deaths else f"{p.total_kills}"
 
-    if p.is_calibrated():
+    if p.is_calibrated:
         level, pct, to_next = _elo_progress(unified_elo)
         bar = _progress_bar(pct)
         next_line = f"до LVL {level+1}: <b>{to_next}</b> ELO" if to_next is not None else "🏆 максимальный уровень"
@@ -1547,12 +1504,11 @@ def build_stats_text(target: int, looking_at_self: bool, private_chat: bool = Tr
             f"{next_line}\n"
         )
     else:
-        left = CALIBRATION_MATCHES - total_games
-        cal_bar = _progress_bar(int(total_games / CALIBRATION_MATCHES * 100))
+        cal_bar = _progress_bar(int(total_games / CALIBRATION_GAMES * 100))
         rank_block = (
-            f"🌙 <b>Калибровка: {total_games}/{CALIBRATION_MATCHES}</b>\n"
-            f"{cal_bar}\n"
-            f"Сыграйте ещё <b>{left}</b> матч(а/ей), чтобы получить свой ранг\n"
+            f"🔄 <b>Калибровка</b>\n"
+            f"{cal_bar}  {total_games}/{CALIBRATION_GAMES} матчей\n"
+            f"Сыграйте ещё <b>{max(0, CALIBRATION_GAMES - total_games)}</b> матч(ей), чтобы получить ранг\n"
         )
 
     text = (
@@ -1568,36 +1524,14 @@ def build_stats_text(target: int, looking_at_self: bool, private_chat: bool = Tr
         f"━━━━━━━━━━━━━━"
     )
 
-    kb = _stats_kb(looking_at_self, private_chat)
-    return (text, kb)
-
-
-def _stats_kb(looking_at_self: bool, private_chat: bool) -> Optional["InlineKeyboardMarkup"]:
+    kb = None
     if looking_at_self and WEBAPP_URL and private_chat:
-        return InlineKeyboardMarkup([[InlineKeyboardButton(
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton(
             "📊 Подробная статистика и история матчей",
             web_app=WebAppInfo(url=WEBAPP_URL)
         )]])
-    return None
 
-
-async def _fetch_avatar_bytes(bot, user_id: int) -> Optional[bytes]:
-    """Скачивает аватар пользователя из Telegram (самое большое доступное фото).
-    Возвращает None, если аватара нет или его не удалось скачать —
-    render_stats_card в этом случае просто рисует плейсхолдер с логотипом."""
-    try:
-        photos = await bot.get_user_profile_photos(user_id, limit=1)
-        if not photos or not photos.photos:
-            return None
-        biggest = photos.photos[0][-1]
-        tg_file = await bot.get_file(biggest.file_id)
-        buf = io.BytesIO()
-        await tg_file.download_to_memory(out=buf)
-        buf.seek(0)
-        return buf.read()
-    except Exception as e:
-        print(f"⚠️ Не удалось получить аватар uid={user_id}: {e!r}")
-        return None
+    return (text, kb)
 
 
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1621,37 +1555,33 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         looking_at_self = (target == uid)
         private_chat = (update.effective_chat.type == "private")
-        kb = _stats_kb(looking_at_self, private_chat)
+        text, kb = build_stats_text(target, looking_at_self, private_chat)
 
-        # Пробуем собрать PNG-карточку профиля (как /top). Аватар тянем из
-        # Telegram; если это не удалось, отрисуется плейсхолдер с логотипом —
-        # карточка всё равно будет сгенерирована.
+        # Если игрок не зарегистрирован / это бот — build_stats_text уже вернул
+        # понятное сообщение об этом, картинку в таком случае не рисуем.
         card_path = _os.path.join(
             _os.path.dirname(_os.path.abspath(__file__)),
             f"_stats_card_{target}_{update.effective_chat.id}.png"
         )
         result = None
         try:
-            avatar_bytes = await _fetch_avatar_bytes(context.bot, target)
-            result = render_stats_card(card_path, target, avatar_bytes)
+            result = render_stats_card(target, card_path)
         except Exception as e:
             print(f"⚠️ Не удалось сгенерировать карточку профиля uid={target}: {e!r}")
             result = None
 
-        if result:
-            try:
-                with open(result, "rb") as f:
-                    await update.message.reply_photo(photo=f, reply_markup=kb)
-            finally:
-                try:
-                    os.remove(result)
-                except OSError:
-                    pass
+        if not result:
+            await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
             return
 
-        # Фолбэк на текст: игрок не зарегистрирован / тестовый бот / ошибка рендера
-        text, _kb = build_stats_text(target, looking_at_self, private_chat)
-        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        try:
+            with open(result, "rb") as f:
+                await update.message.reply_photo(photo=f, reply_markup=kb)
+        finally:
+            try:
+                os.remove(result)
+            except OSError:
+                pass
     except Exception as e:
         import traceback
         print(f"[stats_cmd ERROR] uid={update.effective_user.id} error={e}\n{traceback.format_exc()}")
@@ -1729,37 +1659,21 @@ def _card_draw_logo_icon(d: ImageDraw.ImageDraw, cx: float, cy: float, size: flo
 
 
 def _card_draw_hex(d: ImageDraw.ImageDraw, cx: float, cy: float, size: float, number: int, color, font):
-    """Рисует закрашенный шестиугольный значок уровня — как на оригинальном Faceit
-    (сплошная заливка цветом уровня + белая цифра по центру), а не просто контур с цифрой."""
     pts = [(cx + size * math.cos(math.pi / 6 + i * math.pi / 3),
             cy + size * math.sin(math.pi / 6 + i * math.pi / 3)) for i in range(6)]
-    border = tuple(max(0, int(c * 0.65)) for c in color)
-    d.polygon(pts, fill=color, outline=border, width=2)
+    d.polygon(pts, outline=color, width=3)
     txt = str(number)
-    f_num = _card_fit_font(d, txt, size * 1.15, getattr(font, "size", 19), min_size=12)
-    bbox = d.textbbox((0, 0), txt, font=f_num)
+    bbox = d.textbbox((0, 0), txt, font=font)
     tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    d.text((cx - tw / 2 - bbox[0], cy - th / 2 - bbox[1]), txt, font=f_num, fill=(255, 255, 255))
-
-
-# Палитра уровней как на оригинальном Faceit: 1-2 серый, 3-5 зелёный (от светлого
-# к тёмному), 6-8 оранжевый (от светлого к тёмному), 9-10 красный.
-_LEVEL_COLORS = {
-    1:  (168, 168, 168),
-    2:  (139, 139, 139),
-    3:  (126, 198, 120),
-    4:  (94, 179, 91),
-    5:  (60, 158, 66),
-    6:  (255, 179, 71),
-    7:  (255, 148, 33),
-    8:  (255, 111, 0),
-    9:  (236, 66, 53),
-    10: (214, 28, 28),
-}
+    d.text((cx - tw / 2 - bbox[0], cy - th / 2 - bbox[1]), txt, font=font, fill=color)
 
 
 def _card_level_color(lvl: int):
-    return _LEVEL_COLORS.get(max(1, min(10, int(lvl))), _LEVEL_COLORS[1])
+    if lvl >= 8:
+        return (255, 104, 0)
+    if lvl >= 4:
+        return (255, 184, 0)
+    return (150, 200, 130)
 
 
 def _lvl_number(elo: int) -> int:
@@ -1776,7 +1690,10 @@ def _lvl_number(elo: int) -> int:
 
 
 def build_top_players(limit: int = 10) -> List[Player]:
-    """Возвращает игроков, отсортированных по ELO (используется и текстом, и карточкой)."""
+    """Возвращает калиброванных игроков (сыграно >= CALIBRATION_GAMES матчей),
+    отсортированных по ELO. Используется и текстом, и карточкой /top.
+    Некалиброванные игроки в топ не попадают — как и в настоящем FACEIT,
+    у них ещё нет подтверждённого ранга."""
     db      = load_db()
     players = []
     for d in db["players"].values():
@@ -1792,12 +1709,12 @@ def build_top_players(limit: int = 10) -> List[Player]:
             d.setdefault(field, val)
         d["elo"] = max(d.get("elo", 1000), d.get("elo_5v5", 1000), d.get("elo_2v2", 1000))
         try:
-            pl = _make_player(d)
+            p = _make_player(d)
         except Exception:
             continue
-        if not pl.is_calibrated():
-            continue  # ещё в калибровке — своего ранга нет, в топ не попадает
-        players.append(pl)
+        if not p.is_calibrated:
+            continue
+        players.append(p)
     players.sort(key=lambda p: p.elo, reverse=True)
     return players[:limit]
 
@@ -1867,452 +1784,330 @@ def render_top_card(out_path: str, group_name: str = "NightFaceit", limit: int =
 
 
 # ════════════════════════════════════════════════
-#             КАРТОЧКА ПРОФИЛЯ /stats (PNG)
+#           КАРТОЧКА /stats (PNG, личный профиль)
 # ════════════════════════════════════════════════
 
-def _card_round_mask(size: int, radius_ratio: float = 0.22) -> Image.Image:
-    mask = Image.new("L", (size, size), 0)
-    md = ImageDraw.Draw(mask)
-    md.rounded_rectangle([0, 0, size - 1, size - 1], radius=int(size * radius_ratio), fill=255)
-    return mask
-
-
-def _card_load_avatar(img_bytes: Optional[bytes], size: int) -> Image.Image:
-    """Готовит квадратное RGB-изображение аватара нужного размера.
-    Если байтов нет / декодирование не удалось — рисует плейсхолдер с логотипом."""
-    if img_bytes:
-        try:
-            av = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-            w, h = av.size
-            m = min(w, h)
-            left, top = (w - m) // 2, (h - m) // 2
-            av = av.crop((left, top, left + m, top + m)).resize((size, size), Image.LANCZOS)
-            return av
-        except Exception as e:
-            print(f"⚠️ Не удалось декодировать аватар: {e!r}")
-    placeholder = Image.new("RGB", (size, size), _CARD_LOGO_BG)
-    pd = ImageDraw.Draw(placeholder)
-    _card_draw_logo_icon(pd, size / 2, size / 2, size * 0.62, bg=_CARD_LOGO_BG, border=_CARD_LOGO_BG, bw=0)
-    return placeholder
-
-
-def _card_draw_ring(d: ImageDraw.ImageDraw, cx: float, cy: float, r: float, pct: float,
-                     color, width: int = 16, bg=(30, 28, 44)):
-    """Кольцевой индикатор прогресса (0-100%), старт сверху, по часовой стрелке."""
-    bbox = [cx - r, cy - r, cx + r, cy + r]
-    d.arc(bbox, start=0, end=360, fill=bg, width=width)
-    pct = max(0.0, min(100.0, pct))
-    if pct > 0:
-        end_angle = -90 + 360 * (pct / 100)
-        d.arc(bbox, start=-90, end=end_angle, fill=color, width=width)
-
-
-def _card_draw_hbar(d: ImageDraw.ImageDraw, x: float, y: float, w: float, h: float,
-                     pct: float, color, bg=(30, 28, 44)):
-    pct = max(0.0, min(100.0, pct))
-    d.rounded_rectangle([x, y, x + w, y + h], radius=h / 2, fill=bg)
-    fw = int(w * pct / 100)
-    if fw > 0:
-        d.rounded_rectangle([x, y, x + max(fw, h), y + h], radius=h / 2, fill=color)
-
-
-def _card_panel(d: ImageDraw.ImageDraw, x0: float, y0: float, x1: float, y1: float,
-                 title: str, font_title) -> None:
-    d.rounded_rectangle([x0, y0, x1, y1], radius=18, fill=_CARD_ROW_BG, outline=_CARD_ROW_BORDER, width=1)
-    if title:
-        d.text((x0 + 24, y0 + 20), title, font=font_title, fill=_CARD_GRAY)
-
-
-def _card_fit_font(d: ImageDraw.ImageDraw, txt: str, max_w: float, base_size: int, min_size: int = 16) -> ImageFont.FreeTypeFont:
-    """Подбирает размер шрифта так, чтобы txt не вылезал за max_w (защита от аномальных значений типа K/D=500.00)."""
-    size = base_size
-    while size > min_size:
-        f = _card_font(size)
-        bbox = d.textbbox((0, 0), txt, font=f)
-        if bbox[2] - bbox[0] <= max_w:
-            return f
-        size -= 2
-    return _card_font(min_size)
-
-
-def _player_recent_results(db: dict, uid: int, limit: int = 18) -> List[bool]:
-    """Возвращает список последних результатов игрока (True=победа, False=поражение),
-    от самого свежего к более старому — для сетки «Последние матчи» на карточке."""
-    finished = db.get("finished_matches", {})
-    items = sorted(finished.values(), key=lambda m: m.get("finished_ts", 0), reverse=True)
-    out: List[bool] = []
-    for m in items:
-        if uid in m.get("winners", []):
-            out.append(True)
-        elif uid in m.get("losers", []):
-            out.append(False)
-        else:
-            continue
-        if len(out) >= limit:
-            break
-    return out
-
-
-def _card_header_gradient(w: int, h: int,
-                           left_color=(52, 24, 88), right_color=(9, 8, 15)) -> Image.Image:
-    """Горизонтальный градиент для баннера-шапки карточки (фиолетовый → тёмный)."""
-    grad = Image.new("RGB", (w, 1))
-    for x in range(w):
-        t = x / max(1, w - 1)
-        r = int(left_color[0] + (right_color[0] - left_color[0]) * t)
-        g = int(left_color[1] + (right_color[1] - left_color[1]) * t)
-        b = int(left_color[2] + (right_color[2] - left_color[2]) * t)
-        grad.putpixel((x, 0), (r, g, b))
-    return grad.resize((w, h))
-
-
-def _card_draw_header_deco(img: Image.Image, dr: ImageDraw.ImageDraw, w: int, h: int) -> None:
-    """Диагональные акцентные линии + полупрозрачный водяной знак «NF» в шапке (как на оригинале)."""
-    line_color = (94, 60, 150)
-    for x_off in (0, 46, 92):
-        x0, y0 = w - 220 + x_off, h + 20
-        x1, y1 = x0 + h + 40, -20
-        dr.line([(x0, y0), (x1, y1)], fill=line_color, width=3)
-
-    wm_font = _card_font(150)
-    wm = Image.new("RGBA", (420, 260), (0, 0, 0, 0))
-    wmd = ImageDraw.Draw(wm)
-    wmd.text((10, 10), "NF", font=wm_font, fill=(255, 255, 255, 16))
-    wm = wm.rotate(-10, expand=True, resample=Image.BICUBIC)
-    img.paste(wm, (w - 360, -40), wm)
-
-
-def _card_stat_box(d: ImageDraw.ImageDraw, x: float, y: float, w: float, h: float,
-                    label: str, value: str, pct: float, status_text: str, status_color) -> None:
-    d.rounded_rectangle([x, y, x + w, y + h], radius=16, fill=_CARD_ROW_BG, outline=_CARD_ROW_BORDER, width=1)
-    pad = 18
-    d.text((x + pad, y + pad), label, font=_card_font(16, bold=False), fill=_CARD_GRAY)
-    val_font = _card_fit_font(d, value, w - 2 * pad, 34)
-    d.text((x + pad, y + pad + 28), value, font=val_font, fill=_CARD_WHITE)
-    bar_y = y + h - 38
-    _card_draw_hbar(d, x + pad, bar_y, w - 2 * pad, 8, pct, _CARD_PURPLE_LIT)
-    d.text((x + pad, bar_y + 15), status_text, font=_card_font(14, bold=False), fill=status_color)
-
-
-def _card_quality(value: float, good_th: float, mid_th: float):
-    if value >= good_th:
-        return "Хорошо", _CARD_PURPLE_LIT
-    if value >= mid_th:
-        return "Средне", (200, 190, 130)
-    return "Низкий", _CARD_GRAY
-
-
-def _card_circle_mask(size: int) -> Image.Image:
-    m = Image.new("L", (size, size), 0)
-    ImageDraw.Draw(m).ellipse([0, 0, size - 1, size - 1], fill=255)
-    return m
-
-
-def render_stats_card(out_path: str, target_uid: int, avatar_bytes: Optional[bytes] = None,
-                       group_name: str = "NightFaceit") -> Optional[str]:
-    """Рисует PNG-карточку профиля игрока в стиле веб-приложения Night Faceit:
-    баннер-шапка, ряд плашек статистики, карта/локальная блокировка калибровки,
-    правая колонка (устройство, лига/места, последние матчи).
-    Возвращает out_path, либо None если игрок не зарегистрирован / это тестовый бот."""
+def compute_player_map_stats(uid: int) -> Dict[str, Dict[str, int]]:
+    """Считает победы/поражения/киллы/смерти игрока в разрезе карт,
+    на основе реально сыгранных и завершённых матчей (finished_matches).
+    Никаких выдуманных чисел — только то, что реально записано в БД."""
     db = load_db()
-    s  = str(target_uid)
+    finished = db.get("finished_matches", {})
+    stats: Dict[str, Dict[str, int]] = {}
+    s_uid = str(uid)
+    for m in finished.values():
+        winners = m.get("winners", []) or []
+        losers  = m.get("losers", [])  or []
+        if uid not in winners and uid not in losers:
+            continue
+        map_name = m.get("map") or "—"
+        won = uid in winners
+        kd_by_uid = m.get("kd_by_uid", {}) or {}
+        kills, deaths = kd_by_uid.get(s_uid, [0, 0])
+        row = stats.setdefault(map_name, {"wins": 0, "losses": 0, "kills": 0, "deaths": 0})
+        if won:
+            row["wins"] += 1
+        else:
+            row["losses"] += 1
+        row["kills"]  += int(kills)
+        row["deaths"] += int(deaths)
+    return stats
+
+
+def compute_recent_matches(uid: int, limit: int = 5) -> List[Dict[str, Any]]:
+    """Список последних завершённых матчей игрока (реальные записи из БД),
+    отсортированный от новых к старым."""
+    db = load_db()
+    finished = db.get("finished_matches", {})
+    rows = []
+    s_uid = str(uid)
+    for m_id, m in finished.items():
+        winners = m.get("winners", []) or []
+        losers  = m.get("losers", [])  or []
+        if uid not in winners and uid not in losers:
+            continue
+        won = uid in winners
+        elo_snap = m.get("elo_snapshot", {}) or {}
+        delta = elo_snap.get(s_uid)
+        rows.append({
+            "match_id": m_id,
+            "mode": m.get("mode", "?"),
+            "map": m.get("map") or "—",
+            "won": won,
+            "elo_delta": delta,
+            "ts": m.get("finished_ts", 0),
+        })
+    rows.sort(key=lambda r: r["ts"], reverse=True)
+    return rows[:limit]
+
+
+def _card_draw_donut(d: ImageDraw.ImageDraw, cx: float, cy: float, r: float,
+                      pct: float, label: str, sub_lines: List[str],
+                      font_big, font_small, ring_color=_CARD_PURPLE_LIT, track_color=(40, 38, 56)):
+    """Рисует кольцевую диаграмму (донат) с числом в центре и подписями снизу."""
+    bbox = [cx - r, cy - r, cx + r, cy + r]
+    d.arc(bbox, 0, 360, fill=track_color, width=8)
+    pct = max(0.0, min(1.0, pct))
+    if pct > 0:
+        d.arc(bbox, -90, -90 + 360 * pct, fill=ring_color, width=8)
+    tb = d.textbbox((0, 0), label, font=font_big)
+    tw, th = tb[2] - tb[0], tb[3] - tb[1]
+    d.text((cx - tw / 2 - tb[0], cy - th / 2 - tb[1]), label, font=font_big, fill=_CARD_WHITE)
+    ly = cy + r + 14
+    for line in sub_lines:
+        lb = d.textbbox((0, 0), line, font=font_small)
+        lw = lb[2] - lb[0]
+        d.text((cx - lw / 2 - lb[0], ly), line, font=font_small, fill=_CARD_GRAY)
+        ly += 24
+
+
+def render_stats_card(target: int, out_path: str, group_name: str = "NightFaceit") -> Optional[str]:
+    """Рисует PNG-карточку личного профиля игрока с актуальными данными из БД.
+    Возвращает out_path, либо None если игрок не зарегистрирован / бот."""
+    db = load_db()
+    s = str(target)
     if s not in db["players"] or not db["players"][s].get("external_id"):
         return None
 
-    d = db["players"][s]
+    d_raw = db["players"][s]
     for field, val in [("wins", 0), ("losses", 0), ("avg", 0.0), ("elo", 1000),
                         ("elo_5v5", 1000), ("elo_2v2", 1000),
                         ("wins_5v5", 0), ("losses_5v5", 0),
                         ("wins_2v2", 0), ("losses_2v2", 0),
                         ("avg_5v5", 0.0), ("avg_2v2", 0.0),
-                        ("external_id", ""), ("is_bot", False), ("nickname", "?"), ("user_id", target_uid),
+                        ("external_id", ""), ("is_bot", False),
+                        ("nickname", "?"), ("user_id", target),
                         ("total_kills", 0), ("total_deaths", 0),
                         ("platform", "pc")]:
-        d.setdefault(field, val)
+        d_raw.setdefault(field, val)
+    d_raw["elo"] = max(d_raw.get("elo", 1000), d_raw.get("elo_5v5", 1000), d_raw.get("elo_2v2", 1000))
 
     try:
-        p = _make_player(d)
+        p = _make_player(d_raw)
     except Exception:
         return None
-
     if p.is_bot:
         return None
 
-    total_games = p.wins + p.losses
-    kd_val      = (p.total_kills / p.total_deaths) if p.total_deaths else float(p.total_kills)
-    wr_txt      = f"{p.avg:.0f}%" if total_games else "0%"
-    platform_label = "МОБИЛЬНЫЙ" if p.platform == "mobile" else "ПК"
-    map_name    = MAPS_LIST[0] if MAPS_LIST else "Dust 2"
-    avg_kills   = round(p.total_kills / total_games, 1) if total_games else 0.0
-    calibrated  = p.is_calibrated()
+    W = 1000
+    BG = _CARD_BG
+    total_games = p.total_games
+    wr = (p.wins / total_games * 100) if total_games else 0.0
+    kd = (p.total_kills / p.total_deaths) if p.total_deaths else float(p.total_kills)
 
-    W = _CARD_W
-    MARGIN   = 40
-    HEADER_H = 210
-    GAP      = 24
-    content_top = HEADER_H + GAP
+    f_title  = _card_font(34)
+    f_id     = _card_font(20, bold=False)
+    f_logo   = _card_font(22)
+    f_sect   = _card_font(24)
+    f_box_lb = _card_font(19, bold=False)
+    f_box_val= _card_font(30)
+    f_donut  = _card_font(30)
+    f_small  = _card_font(18, bold=False)
+    f_hex    = _card_font(17)
+    f_map    = _card_font(26)
 
-    LEFT_W   = 760
-    RIGHT_X  = MARGIN + LEFT_W + GAP
-    RIGHT_W  = W - MARGIN - RIGHT_X
+    # ── Считаем высоту карточки заранее ──────────────────────────────────
+    HEADER_H   = 150
+    SECT_GAP   = 46
+    STAT_ROW_H = 210
+    INFO_ROW_H = 130
+    MAP_ROW_H  = 160
+    recent = compute_recent_matches(target, limit=5)
+    RECENT_ROW_H = 46
+    RECENT_BLOCK_H = 40 + max(1, len(recent)) * RECENT_ROW_H + 20
+    FOOTER_H = 70
 
-    # ── Предварительный расчёт высоты холста ──────────────────────────────
-    stat_box_h  = 150
-    map_h       = 230
-    left_bottom = content_top + 40 + stat_box_h + GAP + map_h
+    H = (HEADER_H + SECT_GAP + STAT_ROW_H + 24 + INFO_ROW_H + SECT_GAP +
+         MAP_ROW_H + SECT_GAP + RECENT_BLOCK_H + FOOTER_H)
 
-    device_h  = 150 if calibrated else 92
-    league_h  = 284 if calibrated else 150
-    rm_rows   = 3
-    rm_h      = 44 + rm_rows * 50
-    right_bottom = content_top + device_h + 18 + league_h + 18 + rm_h
+    img = Image.new("RGB", (W, H), BG)
+    d = ImageDraw.Draw(img)
 
-    H = max(left_bottom, right_bottom) + 40 + 60
-    img = Image.new("RGB", (W, H), _CARD_BG)
-    dr  = ImageDraw.Draw(img)
+    # ── ШАПКА ────────────────────────────────────────────────────────────
+    d.rounded_rectangle([24, 24, W - 24, 24 + HEADER_H - 24], radius=18,
+                         fill=(13, 12, 22), outline=(36, 32, 54), width=1)
+    _card_draw_logo_icon(d, 90, 24 + (HEADER_H - 24) / 2, 84)
+    name_y = 24 + (HEADER_H - 24) / 2 - 34
+    display_name = p.nickname if len(p.nickname) <= 18 else p.nickname[:17] + "…"
+    d.text((150, name_y), display_name, font=f_title, fill=_CARD_WHITE)
+    plat_label = "📱 Мобильный" if p.platform == "mobile" else "🖥 ПК"
+    d.text((150, name_y + 44), f"ID: {p.external_id or '—'}   {plat_label}", font=f_id, fill=_CARD_GRAY)
 
-    # ── Шапка-баннер ───────────────────────────────────────────────────────
-    img.paste(_card_header_gradient(W, HEADER_H), (0, 0))
-    dr = ImageDraw.Draw(img)
-    _card_draw_header_deco(img, dr, W, HEADER_H)
+    # логотип NIGHT FACEIT справа
+    pill_w = 220
+    d.rounded_rectangle([W - 24 - pill_w, 40, W - 24, 40 + 52], radius=14,
+                         fill=(13, 12, 22), outline=(36, 32, 54), width=1)
+    _card_draw_logo_icon(d, W - 24 - pill_w + 32, 40 + 26, 30)
+    d.text((W - 24 - pill_w + 58, 40 + 14), group_name, font=f_logo, fill=_CARD_WHITE)
 
-    avatar_size = 120
-    avatar_img  = _card_load_avatar(avatar_bytes, avatar_size)
-    mask        = _card_round_mask(avatar_size)
-    img.paste(avatar_img, (MARGIN, 45), mask)
-    dr.rounded_rectangle([MARGIN, 45, MARGIN + avatar_size, 45 + avatar_size],
-                          radius=int(avatar_size * 0.22), outline=_CARD_PURPLE_LIT, width=2)
+    y = HEADER_H + SECT_GAP - 20
 
-    f_name  = _card_font(36)
-    f_sub   = _card_font(19, bold=False)
-    f_logo  = _card_font(22)
+    # ── СТАТИСТИКА (заголовок) ──────────────────────────────────────────
+    d.text((24, y), "Статистика", font=f_sect, fill=_CARD_WHITE)
+    y += 44
 
-    name_x = MARGIN + avatar_size + 26
-    name = p.nickname if len(p.nickname) <= 20 else p.nickname[:19] + "…"
-    dr.text((name_x, 50), name, font=f_name, fill=_CARD_WHITE)
-    dr.text((name_x, 96), f"GAME ID: {p.external_id or '—'}   •   {platform_label}   •   TG ID: {target_uid}",
-             font=f_sub, fill=(210, 200, 230))
+    # три бокса: K/D | Уровень/Калибровка | Winrate
+    box_w = (W - 48 - 2 * 16) // 3
+    box_y0 = y
+    for i in range(3):
+        bx0 = 24 + i * (box_w + 16)
+        d.rounded_rectangle([bx0, box_y0, bx0 + box_w, box_y0 + STAT_ROW_H], radius=16,
+                             fill=_CARD_ROW_BG, outline=_CARD_ROW_BORDER, width=1)
 
-    badges = []
-    if is_creator(target_uid):
-        badges.append(("Создатель", (255, 196, 90)))
-    elif is_admin(target_uid):
-        badges.append(("Админ", (150, 190, 255)))
-    elif is_moderator(target_uid):
-        badges.append(("Модератор", (150, 220, 180)))
-    if is_youtuber(target_uid):
-        badges.append(("YouTuber", (230, 210, 255)))
+    cx0 = 24 + box_w / 2
+    cx1 = 24 + box_w + 16 + box_w / 2
+    cx2 = 24 + 2 * (box_w + 16) + box_w / 2
+    donut_cy = box_y0 + 80
 
-    bx, by = name_x, 130
-    for label, color in badges:
-        bw_ = dr.textbbox((0, 0), label, font=f_sub)[2] + 28
-        dr.rounded_rectangle([bx, by, bx + bw_, by + 32], radius=16, fill=(0, 0, 0, 0), outline=color, width=2)
-        dr.text((bx + 14, by + 5), label, font=f_sub, fill=color)
-        bx += bw_ + 12
+    # K/D donut (заполнение по доле киллов от киллов+смертей — просто визуальный акцент)
+    kd_fill = (p.total_kills / (p.total_kills + p.total_deaths)) if (p.total_kills + p.total_deaths) else 0.0
+    _card_draw_donut(d, cx0, donut_cy, 62, kd_fill, f"{kd:.2f}", [f"K = {p.total_kills}   D = {p.total_deaths}"],
+                      f_donut, f_small, ring_color=(124, 92, 255))
 
-    dr.rounded_rectangle([W - 260, 36, W - 40, 90], radius=15, fill=(20, 14, 34), outline=(80, 60, 120), width=1)
-    _card_draw_logo_icon(dr, W - 260 + 27, 63, 32)
-    dr.text((W - 260 + 52, 52), group_name, font=f_logo, fill=_CARD_WHITE)
+    # Уровень / Калибровка box
+    if p.is_calibrated:
+        level, pct, to_next = _elo_progress(p.elo)
+        lvl_color = _card_level_color(level)
+        _card_draw_hex(d, cx1, box_y0 + 34, 24, level, lvl_color, f_hex)
+        d.text((cx1 - 26, box_y0 + 66), f"{p.elo} ELO", font=f_box_lb, fill=_CARD_GRAY)
+        bar_w = box_w - 48
+        bar_x = cx1 - bar_w / 2
+        bar_y = box_y0 + 100
+        d.rounded_rectangle([bar_x, bar_y, bar_x + bar_w, bar_y + 14], radius=7, fill=(40, 38, 56))
+        fill_w = bar_w * (pct / 100)
+        if fill_w > 0:
+            d.rounded_rectangle([bar_x, bar_y, bar_x + fill_w, bar_y + 14], radius=7, fill=lvl_color)
+        next_txt = f"до LVL {level+1}: {to_next} ELO" if to_next is not None else "макс. уровень"
+        tb = d.textbbox((0, 0), next_txt, font=f_small)
+        d.text((cx1 - (tb[2]-tb[0]) / 2, bar_y + 26), next_txt, font=f_small, fill=_CARD_GRAY)
+    else:
+        cal_pct = total_games / CALIBRATION_GAMES
+        cal_color = (255, 184, 0)
+        _card_draw_hex(d, cx1, box_y0 + 34, 24, "?", cal_color, f_hex)
+        lbl = "Калибровка"
+        tb = d.textbbox((0, 0), lbl, font=f_box_lb)
+        d.text((cx1 - (tb[2]-tb[0]) / 2, box_y0 + 66), lbl, font=f_box_lb, fill=_CARD_WHITE)
+        bar_w = box_w - 48
+        bar_x = cx1 - bar_w / 2
+        bar_y = box_y0 + 100
+        d.rounded_rectangle([bar_x, bar_y, bar_x + bar_w, bar_y + 14], radius=7, fill=(40, 38, 56))
+        fill_w = bar_w * min(1.0, cal_pct)
+        if fill_w > 0:
+            d.rounded_rectangle([bar_x, bar_y, bar_x + fill_w, bar_y + 14], radius=7, fill=cal_color)
+        sub = f"{total_games}/{CALIBRATION_GAMES} матчей"
+        tb = d.textbbox((0, 0), sub, font=f_small)
+        d.text((cx1 - (tb[2]-tb[0]) / 2, bar_y + 26), sub, font=f_small, fill=_CARD_GRAY)
 
-    # ── Левая колонка: заголовок «Статистика» + 4 плашки ──────────────────
-    f_section = _card_font(24)
-    f_tag     = _card_font(16, bold=False)
+    # Winrate donut
+    _card_draw_donut(d, cx2, donut_cy, 62, wr / 100, f"{wr:.0f}%", [f"W = {p.wins}   L = {p.losses}"],
+                      f_donut, f_small, ring_color=(90, 220, 140))
 
-    dr.text((MARGIN, content_top), "📊 Статистика", font=f_section, fill=_CARD_WHITE)
-    tag_txt = SEASON_NAME
-    tag_w = dr.textbbox((0, 0), tag_txt, font=f_tag)[2] + 30
-    dr.rounded_rectangle([MARGIN + LEFT_W - tag_w, content_top, MARGIN + LEFT_W, content_top + 32],
-                          radius=16, fill=(17, 16, 28), outline=(40, 36, 60), width=1)
-    dr.text((MARGIN + LEFT_W - tag_w + 15, content_top + 6), tag_txt, font=f_tag, fill=_CARD_GRAY)
+    y = box_y0 + STAT_ROW_H + 24
 
-    boxes_y = content_top + 40
-    box_gap = 14
-    box_w   = (LEFT_W - 3 * box_gap) / 4
-
-    kd_q, kd_c   = _card_quality(kd_val, 1.3, 0.9)
-    wr_q, wr_c   = _card_quality(p.avg if total_games else 0.0, 60, 40)
-    avg_q, avg_c = _card_quality(avg_kills, 15, 8)
-
-    stats = [
-        ("K/D",      f"{kd_val:.2f}", min(100.0, kd_val / 2 * 100), kd_q, kd_c),
-        ("Win Rate", wr_txt,          p.avg if total_games else 0.0, wr_q, wr_c),
-        ("AVG",      f"{avg_kills:.1f}", min(100.0, avg_kills / 20 * 100), avg_q, avg_c),
-        ("Матчи",    str(total_games), min(100.0, total_games / 30 * 100), "Сыграно", _CARD_GRAY),
+    # ── ИНФО-БОКСЫ: Матчей, 5v5, 2v2 ────────────────────────────────────
+    info_box_w = (W - 48 - 2 * 16) // 3
+    info_items = [
+        ("Матчей всего", str(total_games)),
+        ("5v5", f"{p.wins_5v5}W / {p.losses_5v5}L"),
+        ("2v2", f"{p.wins_2v2}W / {p.losses_2v2}L"),
     ]
-    for i, (label, value, pct, status_text, status_color) in enumerate(stats):
-        bx0 = MARGIN + i * (box_w + box_gap)
-        _card_stat_box(dr, bx0, boxes_y, box_w, stat_box_h, label, value, pct, status_text, status_color)
+    for i, (lbl, val) in enumerate(info_items):
+        bx0 = 24 + i * (info_box_w + 16)
+        d.rounded_rectangle([bx0, y, bx0 + info_box_w, y + INFO_ROW_H], radius=16,
+                             fill=_CARD_ROW_BG, outline=_CARD_ROW_BORDER, width=1)
+        d.text((bx0 + 20, y + 20), lbl, font=f_box_lb, fill=_CARD_GRAY)
+        d.text((bx0 + 20, y + 56), val, font=f_box_val, fill=_CARD_WHITE)
 
-    # ── Левая колонка: карта / блокировка калибровки ──────────────────────
-    map_y0 = boxes_y + stat_box_h + GAP
-    dr.rounded_rectangle([MARGIN, map_y0, MARGIN + LEFT_W, map_y0 + map_h],
-                          radius=18, fill=_CARD_ROW_BG, outline=_CARD_ROW_BORDER, width=1)
+    y += INFO_ROW_H + SECT_GAP - 20
 
-    if calibrated:
-        dr.text((MARGIN + 24, map_y0 + 20), "🗺 Статистика по карте", font=_card_font(19, bold=False), fill=_CARD_GRAY)
+    # ── СТАТИСТИКА ПО КАРТАМ (без картинки — просто плашка с названием) ──
+    d.text((24, y), "Статистика по картам", font=f_sect, fill=_CARD_WHITE)
+    y += 44
 
-        circ_size = 100
-        circ = Image.new("RGB", (circ_size, circ_size), (150, 125, 90))
-        cdraw = ImageDraw.Draw(circ)
-        cdraw.pieslice([0, 0, circ_size - 1, circ_size - 1], start=200, end=380, fill=(112, 92, 62))
-        cmask = _card_circle_mask(circ_size)
-        img.paste(circ, (MARGIN + 24, map_y0 + 66), cmask)
-        dr.ellipse([MARGIN + 24, map_y0 + 66, MARGIN + 24 + circ_size, map_y0 + 66 + circ_size],
-                   outline=_CARD_LOGO_BORDER, width=2)
+    map_name = MAPS_LIST[0] if MAPS_LIST else "Dust 2"
+    map_stats = compute_player_map_stats(target).get(map_name)
 
-        mx = MARGIN + 24 + circ_size + 28
-        dr.text((mx, map_y0 + 74), map_name, font=_card_font(28), fill=_CARD_WHITE)
-        dr.text((mx, map_y0 + 118), f"W = {p.wins}   L = {p.losses}", font=_card_font(19, bold=False), fill=(150, 190, 255))
-        dr.text((mx, map_y0 + 150), "Win Rate", font=_card_font(16, bold=False), fill=_CARD_GRAY)
-        dr.text((mx, map_y0 + 172), wr_txt, font=_card_font(34), fill=_CARD_PURPLE_LIT)
+    d.rounded_rectangle([24, y, W - 24, y + MAP_ROW_H], radius=16,
+                         fill=_CARD_ROW_BG, outline=_CARD_ROW_BORDER, width=1)
+    # цветная плашка вместо фото карты
+    tile_w = 150
+    d.rounded_rectangle([24 + 16, y + 16, 24 + 16 + tile_w, y + MAP_ROW_H - 16], radius=12,
+                         fill=(30, 26, 46), outline=(60, 52, 92), width=2)
+    initials = "".join(w[0] for w in map_name.split()[:2]).upper()
+    tb = d.textbbox((0, 0), initials, font=f_title)
+    tcx, tcy = 24 + 16 + tile_w / 2, y + MAP_ROW_H / 2
+    d.text((tcx - (tb[2]-tb[0]) / 2 - tb[0], tcy - (tb[3]-tb[1]) / 2 - tb[1]), initials, font=f_title, fill=_CARD_PURPLE_LIT)
+
+    tx = 24 + 16 + tile_w + 24
+    d.text((tx, y + 20), map_name, font=f_map, fill=_CARD_WHITE)
+    if map_stats and (map_stats["wins"] + map_stats["losses"]) > 0:
+        mw, ml = map_stats["wins"], map_stats["losses"]
+        mtotal = mw + ml
+        mwr = mw / mtotal * 100
+        mkd = (map_stats["kills"] / map_stats["deaths"]) if map_stats["deaths"] else float(map_stats["kills"])
+        d.text((tx, y + 60), f"W = {mw}   L = {ml}   WR = {mwr:.0f}%", font=f_box_lb, fill=_CARD_GRAY)
+        d.text((tx, y + 92), f"K/D на карте: {mkd:.2f}", font=f_box_lb, fill=_CARD_GRAY)
     else:
-        left_matches = max(0, CALIBRATION_MATCHES - total_games)
-        dr.text((MARGIN + 24, map_y0 + 20), "🗺 Статистика по картам", font=_card_font(19, bold=False), fill=_CARD_GRAY)
+        d.text((tx, y + 60), "Нет сыгранных матчей на этой карте", font=f_box_lb, fill=_CARD_GRAY)
 
-        # значок замка
-        lock_cx, lock_cy = MARGIN + LEFT_W // 2, map_y0 + 78
-        dr.arc([lock_cx - 16, lock_cy - 28, lock_cx + 16, lock_cy], start=180, end=360, fill=_CARD_GRAY, width=4)
-        dr.rounded_rectangle([lock_cx - 22, lock_cy - 4, lock_cx + 22, lock_cy + 30], radius=6,
-                              fill=(24, 22, 36), outline=_CARD_GRAY, width=2)
+    y += MAP_ROW_H + SECT_GAP - 20
 
-        f_lock1 = _card_font(20)
-        f_lock2 = _card_font(15, bold=False)
-        line1 = "Подробная статистика по картам"
-        line2 = "откроется после калибровки"
-        line3 = f"Сыграйте ещё {left_matches} матч(ей), чтобы увидеть аналитику."
-        for text, yy, fnt, col in [
-            (line1, map_y0 + 122, f_lock1, _CARD_WHITE),
-            (line2, map_y0 + 150, f_lock1, _CARD_WHITE),
-            (line3, map_y0 + 182, f_lock2, _CARD_GRAY),
-        ]:
-            tw = dr.textbbox((0, 0), text, font=fnt)[2]
-            dr.text((MARGIN + LEFT_W / 2 - tw / 2, yy), text, font=fnt, fill=col)
-
-        dot_r = 5
-        dot_gap = 18
-        dots_total = CALIBRATION_MATCHES
-        start_x = MARGIN + LEFT_W / 2 - (dots_total - 1) * dot_gap / 2
-        for i in range(dots_total):
-            cx_d = start_x + i * dot_gap
-            cy_d = map_y0 + 208
-            col = _CARD_PURPLE_LIT if i < total_games else (60, 56, 78)
-            dr.ellipse([cx_d - dot_r, cy_d - dot_r, cx_d + dot_r, cy_d + dot_r], fill=col)
-
-    # ── Правая колонка: устройство/дата (+матчи/MVP) ───────────────────────
-    rx0, rx1 = RIGHT_X, W - MARGIN
-    ry = content_top
-    dr.rounded_rectangle([rx0, ry, rx1, ry + device_h], radius=18, fill=_CARD_ROW_BG, outline=_CARD_ROW_BORDER, width=1)
-
-    f_cell_lab = _card_font(15, bold=False)
-    f_cell_val = _card_font(20)
-    cell_w = (RIGHT_W - 3 * 20) / 2
-
-    def _cell(cx, cy, label, value, value_color=_CARD_WHITE):
-        dr.text((cx, cy), label, font=f_cell_lab, fill=_CARD_GRAY)
-        dr.text((cx, cy + 22), value, font=f_cell_val, fill=value_color)
-
-    _cell(rx0 + 20, ry + 20, "📱 Устройство", platform_label, _CARD_PURPLE_LIT)
-    _cell(rx0 + 20 + cell_w + 20, ry + 20, "📅 Дата регистрации", "—")
-    if calibrated:
-        _cell(rx0 + 20, ry + 86, "🎮 Матчей", str(total_games))
-        _cell(rx0 + 20 + cell_w + 20, ry + 86, "⭐ MVP", "—")
-
-    # ── Правая колонка: лига / места ────────────────────────────────────────
-    league_y0 = ry + device_h + 18
-    dr.rounded_rectangle([rx0, league_y0, rx1, league_y0 + league_h], radius=18,
-                          fill=_CARD_ROW_BG, outline=_CARD_ROW_BORDER, width=1)
-    dr.text((rx0 + 20, league_y0 + 18), "Лига", font=_card_font(15, bold=False), fill=_CARD_GRAY)
-    dr.text((rx0 + 20, league_y0 + 38), "Default", font=_card_font(26), fill=_CARD_WHITE)
-
-    star_cx, star_cy = rx1 - 40, league_y0 + 44
-    if calibrated:
-        lvl = _lvl_number(p.elo)
-        hc  = _card_level_color(lvl)
-        _card_draw_hex(dr, star_cx, star_cy, 22, lvl, hc, _card_font(16))
+    # ── ПОСЛЕДНИЕ МАТЧИ ───────────────────────────────────────────────────
+    d.text((24, y), "Последние матчи", font=f_sect, fill=_CARD_WHITE)
+    y += 44
+    d.rounded_rectangle([24, y, W - 24, y + RECENT_BLOCK_H - 20], radius=16,
+                         fill=_CARD_ROW_BG, outline=_CARD_ROW_BORDER, width=1)
+    ry = y + 16
+    if not recent:
+        d.text((44, ry), "Матчей пока нет", font=f_box_lb, fill=_CARD_GRAY)
     else:
-        _card_draw_hex(dr, star_cx, star_cy, 22, 0, (90, 88, 100), _card_font(16))
-
-    if calibrated:
-        top_players = build_top_players(limit=3)
-        rows = list(enumerate(top_players, start=1))
-        own_in_top = any(pl.user_id == target_uid for pl in top_players)
-        if not own_in_top:
-            all_players = build_top_players(limit=1000)
-            own_rank = next((i for i, pl in enumerate(all_players, start=1) if pl.user_id == target_uid), None)
-            if own_rank:
-                rows.append((own_rank, p))
-
-        ry2 = league_y0 + 84
-        f_rank = _card_font(16, bold=False)
-        f_pname = _card_font(18)
-        f_pelo = _card_font(18)
-        for rank, pl in rows:
-            is_self = (pl.user_id == target_uid)
-            row_h = 42
-            if is_self:
-                dr.rounded_rectangle([rx0 + 12, ry2 - 6, rx1 - 12, ry2 + row_h - 6], radius=10,
-                                      outline=_CARD_PURPLE_LIT, width=2, fill=(22, 16, 36))
-            dr.text((rx0 + 20, ry2), f"#{rank}", font=f_rank, fill=_CARD_GRAY)
-            pname = pl.nickname if len(pl.nickname) <= 14 else pl.nickname[:13] + "…"
-            dr.text((rx0 + 62, ry2 - 2), pname, font=f_pname, fill=_CARD_WHITE if is_self else (215, 215, 224))
-            elo_txt = str(pl.elo)
-            ew = dr.textbbox((0, 0), elo_txt, font=f_pelo)[2]
-            dr.text((rx1 - 24 - ew, ry2 - 2), elo_txt, font=f_pelo, fill=_CARD_PURPLE_LIT if is_self else _CARD_WHITE)
-            ry2 += row_h
-    else:
-        dr.text((rx0 + 20, league_y0 + 84), "ELO", font=_card_font(15, bold=False), fill=_CARD_GRAY)
-        _card_draw_hex(dr, rx0 + 40, league_y0 + 128, 20, 0, (90, 88, 100), _card_font(16))
-        dr.text((rx0 + 70, league_y0 + 115), "0", font=_card_font(26), fill=_CARD_WHITE)
-        dr.text((rx0 + 20, league_y0 + 168), "Позиция в лиге", font=_card_font(15, bold=False), fill=_CARD_GRAY)
-        dr.text((rx0 + 20, league_y0 + 190), "—", font=_card_font(20), fill=_CARD_WHITE)
-
-    # ── Правая колонка: последние матчи ────────────────────────────────────
-    rm_y0 = league_y0 + league_h + 18
-    dr.rounded_rectangle([rx0, rm_y0, rx1, rm_y0 + rm_h], radius=18, fill=_CARD_ROW_BG, outline=_CARD_ROW_BORDER, width=1)
-    dr.text((rx0 + 20, rm_y0 + 16), "⚔ Последние матчи", font=_card_font(17, bold=False), fill=_CARD_GRAY)
-
-    results = _player_recent_results(db, target_uid, limit=18)
-    cols = 6
-    cell = 40
-    cgap = 10
-    grid_x0 = rx0 + 20
-    grid_y0 = rm_y0 + 48
-    for idx in range(18):
-        col_i = idx % cols
-        row_i = idx // cols
-        gx = grid_x0 + col_i * (cell + cgap)
-        gy = grid_y0 + row_i * (cell + cgap)
-        if idx < len(results):
-            won = results[idx]
-            fill_c = (40, 130, 80) if won else (140, 45, 45)
-            dr.rounded_rectangle([gx, gy, gx + cell, gy + cell], radius=10, fill=fill_c)
+        for r in recent:
+            won = r["won"]
+            badge_color = (90, 220, 140) if won else (230, 100, 100)
+            badge_bg    = (20, 40, 30) if won else (45, 20, 20)
+            badge_x0, badge_y0 = 44, ry - 3
+            badge_size = 28
+            d.rounded_rectangle([badge_x0, badge_y0, badge_x0 + badge_size, badge_y0 + badge_size],
+                                 radius=7, fill=badge_bg, outline=badge_color, width=2)
             letter = "W" if won else "L"
-            f_wl = _card_font(18)
-            tw, th = dr.textbbox((0, 0), letter, font=f_wl)[2:]
-            dr.text((gx + cell / 2 - tw / 2, gy + cell / 2 - th / 2), letter, font=f_wl, fill=_CARD_WHITE)
-        else:
-            dr.rounded_rectangle([gx, gy, gx + cell, gy + cell], radius=10, outline=(38, 36, 52), width=1)
+            lb = d.textbbox((0, 0), letter, font=f_box_lb)
+            d.text((badge_x0 + badge_size/2 - (lb[2]-lb[0])/2 - lb[0],
+                    badge_y0 + badge_size/2 - (lb[3]-lb[1])/2 - lb[1]), letter, font=f_box_lb, fill=badge_color)
 
-    # ── Подвал ─────────────────────────────────────────────────────────────
-    footer_y = max(map_y0 + map_h, rm_y0 + rm_h) + 34
-    f_logo_footer = _card_font(22)
-    _card_draw_logo_icon(dr, W // 2 - 90, footer_y + 15, 30)
-    dr.text((W // 2 - 58, footer_y), "NIGHT FACEIT", font=f_logo_footer, fill=_CARD_WHITE)
+            dt_label = datetime.fromtimestamp(r["ts"]).strftime("%d.%m %H:%M") if r["ts"] else "—"
+            delta = r["elo_delta"]
+            if delta is not None:
+                delta_txt = f"+{delta} ELO" if won else f"-{delta} ELO"
+            else:
+                delta_txt = ""
+            line = f"#{r['match_id']}  [{r['mode'].upper()}]  {r['map']}   {dt_label}"
+            d.text((badge_x0 + badge_size + 16, ry), line, font=f_box_lb, fill=_CARD_WHITE)
+            if delta_txt:
+                tb = d.textbbox((0, 0), delta_txt, font=f_box_lb)
+                d.text((W - 44 - (tb[2]-tb[0]), ry), delta_txt,
+                       font=f_box_lb, fill=badge_color)
+            ry += RECENT_ROW_H
 
-    H_actual = footer_y + 50
-    img = img.crop((0, 0, W, H_actual))
+    y += RECENT_BLOCK_H
+
+    # ── FOOTER ───────────────────────────────────────────────────────────
+    footer = "NIGHT FACEIT"
+    d.line([(24, y + 10), (W - 24, y + 10)], fill=_CARD_ROW_BORDER, width=1)
+    tb = d.textbbox((0, 0), footer, font=f_logo)
+    fcx = W / 2
+    _card_draw_logo_icon(d, fcx - (tb[2]-tb[0]) / 2 - 26, y + 40, 26)
+    d.text((fcx - (tb[2]-tb[0]) / 2 + 4, y + 40 - 12), footer, font=f_logo, fill=_CARD_WHITE)
+
     img.save(out_path)
     return out_path
 
 
 def build_top_text() -> str:
-    """Текст топ-10 игроков. Переиспользуется /top и кнопкой «🏆 Топ» (фолбэк,
-    если PNG-карточку не удалось сгенерировать). Некалиброванные игроки
-    (< CALIBRATION_MATCHES матчей) в рейтинг не попадают — см. build_top_players."""
-    players = build_top_players(limit=10)
+    """Текст топ-10 игроков. Переиспользуется /top (как фолбэк) и кнопкой «🏆 Топ»."""
+    players = build_top_players(10)
 
     if not players:
-        return "🏆 Рейтинг пока пуст.\n\nСыграйте и выиграйте не менее 5 матчей, чтобы пройти калибровку и попасть в топ."
+        return "🏆 Рейтинг пока пуст.\n\nНи один игрок ещё не прошёл калибровку (нужно сыграть 5 матчей)."
 
     medals = ["🥇","🥈","🥉","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
     lines  = ["🏆 <b>Топ-10 — Night Faceit</b>\n━━━━━━━━━━━━━━"]
@@ -3503,7 +3298,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             host_uid  = m.get("host_uid", ct_cap)
             host_p    = get_player(host_uid)
             host_side = "🔵 CT" if host_uid == ct_cap else "🔴 T"
-            final_map = m["maps"][0] if m["maps"] else "Dust 2"
+            final_map = m["maps"][0] if m["maps"] else "Seaside"
             m["phase"] = "done"
             try:
                 await q.edit_message_text(
@@ -4044,18 +3839,6 @@ async def win_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     win_lines:  List[str] = []
     loss_lines: List[str] = []
 
-    # Игроки, которым после матча нужно прислать PNG-карточку профиля:
-    # те, кто всё ещё калибруется, и те, кто только что прошёл калибровку
-    # (получил свой первый ранг). card_caption — подпись под карточкой.
-    card_uids:    List[int] = []
-    card_caption: Dict[int, str] = {}
-
-    # Полный снапшот состояния каждого игрока ДО этого матча — нужен для
-    # точного отката в /cancelwin (особенно важно на переходе через
-    # калибровку, когда ELO не просто прибавляется/убавляется дельтой,
-    # а пересчитывается целиком).
-    before_snapshot: Dict[str, dict] = {}
-
     def _apply(target_uid: int, won: bool, lines: List[str]) -> None:
         if _is_bot_uid(target_uid):
             return
@@ -4064,30 +3847,19 @@ async def win_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not pdata:
             return
 
-        before_snapshot[s] = {
-            "elo":            pdata.get("elo", 1000),
-            "elo_5v5":        pdata.get("elo_5v5", 1000),
-            "elo_2v2":        pdata.get("elo_2v2", 1000),
-            "wins":           pdata.get("wins", 0),
-            "losses":         pdata.get("losses", 0),
-            f"wins_{mode}":   pdata.get(f"wins_{mode}", 0),
-            f"losses_{mode}": pdata.get(f"losses_{mode}", 0),
-            "avg":            pdata.get("avg", 0.0),
-            f"avg_{mode}":    pdata.get(f"avg_{mode}", 0.0),
-            "total_kills":    pdata.get("total_kills", 0),
-            "total_deaths":   pdata.get("total_deaths", 0),
-        }
+        platform      = pdata.get("platform", "pc")
+        win_d, loss_d = elo_deltas_for(platform)
+        delta         = win_d if won else -loss_d
 
-        was_calibrated = is_calibrated(pdata.get("wins", 0), pdata.get("losses", 0))
-        platform       = pdata.get("platform", "pc")
-        win_d, loss_d  = elo_deltas_for(platform)
+        for field in ("elo", f"elo_{mode}"):
+            pdata[field] = max(ELO_MIN, pdata.get(field, 1000) + delta)
 
         if won:
-            pdata["wins"]           = pdata.get("wins", 0) + 1
-            pdata[f"wins_{mode}"]   = pdata.get(f"wins_{mode}", 0) + 1
+            pdata["wins"]            = pdata.get("wins", 0) + 1
+            pdata[f"wins_{mode}"]    = pdata.get(f"wins_{mode}", 0) + 1
         else:
-            pdata["losses"]         = pdata.get("losses", 0) + 1
-            pdata[f"losses_{mode}"] = pdata.get(f"losses_{mode}", 0) + 1
+            pdata["losses"]          = pdata.get("losses", 0) + 1
+            pdata[f"losses_{mode}"]  = pdata.get(f"losses_{mode}", 0) + 1
 
         w, l   = pdata.get("wins", 0), pdata.get("losses", 0)
         wm, lm = pdata.get(f"wins_{mode}", 0), pdata.get(f"losses_{mode}", 0)
@@ -4100,48 +3872,11 @@ async def win_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pdata["total_deaths"] = pdata.get("total_deaths", 0) + deaths
         total_kd = round(pdata["total_kills"] / pdata["total_deaths"], 2) if pdata["total_deaths"] else float(pdata["total_kills"])
 
-        now_calibrated = is_calibrated(w, l)
-
-        if not was_calibrated and now_calibrated:
-            # ── Калибровка только что завершилась: считаем реальный ELO по
-            # накопленным винрейту и KD за все калибровочные матчи, а не
-            # продолжаем от одинаковых для всех дефолтных 1000.
-            # ВАЖНО: обновляем ВСЕ поля ELO (общий + elo_5v5 + elo_2v2) одним
-            # значением, а не только поле текущего режима матча — иначе
-            # непройденный режим остаётся на дефолтных 1000 и портит /top
-            # (там берётся max(elo, elo_5v5, elo_2v2)) и карточку профиля.
-            calib_elo            = calibrated_elo_for(w, l, pdata["total_kills"], pdata["total_deaths"])
-            pdata["elo"]         = calib_elo
-            pdata["elo_5v5"]     = calib_elo
-            pdata["elo_2v2"]     = calib_elo
-            elo_status = f"→ <b>{calib_elo}</b> ELO (калибровка завершена, ранг присвоен)"
-
-            card_uids.append(target_uid)
-            card_caption[target_uid] = (
-                f"🎉 {pdata.get('nickname', '?')} прошёл(ла) калибровку!\n"
-                f"Ранг присвоен: LVL {_lvl_number(calib_elo)} — {calib_elo} ELO"
-            )
-        elif not was_calibrated:
-            # ── Всё ещё калибруется — ELO не трогаем, только копим статистику.
-            left = CALIBRATION_MATCHES - matches_played_of(w, l)
-            elo_status = f"(калибровка {matches_played_of(w, l)}/{CALIBRATION_MATCHES}, ELO пока скрыт, ещё {left})"
-
-            card_uids.append(target_uid)
-            card_caption[target_uid] = (
-                f"🌙 {pdata.get('nickname', '?')} — калибровка "
-                f"{matches_played_of(w, l)}/{CALIBRATION_MATCHES}"
-            )
-        else:
-            delta = win_d if won else -loss_d
-            for field in ("elo", f"elo_{mode}"):
-                pdata[field] = max(ELO_MIN, pdata.get(field, 1000) + delta)
-            sign = "+" if won else "-"
-            applied = win_d if won else loss_d
-            elo_status = f"{sign}{applied} ELO → <b>{pdata['elo']}</b>"
-
         nick = pdata.get("nickname", "?")
+        sign = "+" if won else "-"
+        applied = win_d if won else loss_d
         lines.append(
-            f"  • {nick}: {elo_status} | "
+            f"  • {nick}: {sign}{applied} ELO → <b>{pdata['elo']}</b> | "
             f"{kills}/{deaths} (KD матча {round(kills/deaths, 2) if deaths else kills}) | "
             f"общий KD: <b>{total_kd}</b>"
         )
@@ -4153,24 +3888,21 @@ async def win_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Сохраняем снапшот для возможной отмены (/cancelwin) ─────────────────
     kd_snapshot = {str(uid): list(kd_by_uid.get(uid, (0, 0))) for uid in all_uids}
-    # Фактически применённое изменение ELO (со знаком) — для истории матчей
-    # в /api/match_history. Во время калибровки ELO может вообще не измениться
-    # (0), а в момент завершения калибровки — измениться сразу на много.
-    elo_delta_snapshot: Dict[str, int] = {}
+    # Сохраняем фактически применённые дельты ELO для точного отката в /cancelwin
+    elo_snapshot: Dict[str, int] = {}
     for uid in all_uids:
         s_snap = str(uid)
-        before = before_snapshot.get(s_snap)
-        if before is None:
-            continue
-        elo_delta_snapshot[s_snap] = db["players"].get(s_snap, {}).get("elo", before.get("elo", 1000)) - before.get("elo", 1000)
+        pdata_snap = db["players"].get(s_snap, {})
+        platform_snap = pdata_snap.get("platform", "pc")
+        win_d_s, loss_d_s = elo_deltas_for(platform_snap)
+        elo_snapshot[s_snap] = win_d_s if uid in winners else loss_d_s
     db.setdefault("finished_matches", {})[m_id] = {
-        "mode":            mode,
-        "map":             m["maps"][0] if m.get("maps") else None,
-        "winners":         winners,
-        "losers":          losers,
-        "kd_by_uid":       kd_snapshot,
-        "before_snapshot": before_snapshot,
-        "elo_delta":       elo_delta_snapshot,
+        "mode":         mode,
+        "map":          m["maps"][0] if m.get("maps") else None,
+        "winners":      winners,
+        "losers":       losers,
+        "kd_by_uid":    kd_snapshot,
+        "elo_snapshot": elo_snapshot,
         "finished_ts":  datetime.now().timestamp(),
     }
 
@@ -4188,55 +3920,6 @@ async def win_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         + ("\n".join(loss_lines) if loss_lines else "  (нет реальных игроков)")
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
-
-    # ── Карточки профиля тем, кто ещё калибруется или только что прошёл
-    # калибровку. Генерируем PNG (render_stats_card) и шлём в тот же чат:
-    # одной фоткой, если игрок один, альбомом — если несколько.
-    if card_uids:
-        tmp_paths: List[str] = []
-        for cu in card_uids:
-            try:
-                avatar_bytes = await _fetch_avatar_bytes(context.bot, cu)
-                cpath = _os.path.join(
-                    _os.path.dirname(_os.path.abspath(__file__)),
-                    f"_win_card_{m_id}_{cu}.png"
-                )
-                result = render_stats_card(cpath, cu, avatar_bytes)
-                if result:
-                    tmp_paths.append(result)
-            except Exception as e:
-                print(f"⚠️ Не удалось сгенерировать карточку профиля uid={cu}: {e!r}")
-
-        try:
-            if len(tmp_paths) == 1:
-                cu = card_uids[0] if len(card_uids) == 1 else None
-                caption = card_caption.get(cu) if cu is not None else None
-                with open(tmp_paths[0], "rb") as f:
-                    await update.message.reply_photo(photo=f, caption=caption, parse_mode=ParseMode.HTML)
-            elif len(tmp_paths) > 1:
-                opened = [open(p, "rb") for p in tmp_paths]
-                # Сопоставляем открытые файлы с подписями по имени файла
-                # (в нём зашит owner uid) — надёжнее, чем по индексу, т.к.
-                # для части card_uids рендер карточки мог не удаться.
-                media = []
-                for path, f in zip(tmp_paths, opened):
-                    owner_uid = None
-                    for cu in card_uids:
-                        if f"_win_card_{m_id}_{cu}.png" in path:
-                            owner_uid = cu
-                            break
-                    media.append(InputMediaPhoto(f, caption=card_caption.get(owner_uid), parse_mode=ParseMode.HTML))
-                try:
-                    await context.bot.send_media_group(chat_id=update.effective_chat.id, media=media)
-                finally:
-                    for f in opened:
-                        f.close()
-        finally:
-            for p in tmp_paths:
-                try:
-                    os.remove(p)
-                except OSError:
-                    pass
 
 
 async def cancelwin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4278,8 +3961,7 @@ async def cancelwin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     losers   = snapshot.get("losers",  [])
     kd_by_uid_snap = snapshot.get("kd_by_uid", {})  # {str(uid): [kills, deaths]}
 
-    before_snapshot = snapshot.get("before_snapshot", {})      # {str(uid): полное состояние ДО матча}
-    elo_snapshot    = snapshot.get("elo_snapshot", {})         # legacy: {str(uid): точная дельта из старых /win}
+    elo_snapshot = snapshot.get("elo_snapshot", {})  # {str(uid): точная дельта из /win}
 
     lines = []
 
@@ -4291,17 +3973,7 @@ async def cancelwin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not pdata:
             return
 
-        if s in before_snapshot:
-            # ── Новый формат: просто восстанавливаем полный снапшот ДО матча.
-            # Работает корректно и для обычных дельт, и для перехода через
-            # калибровку (когда ELO не дельта, а целиком пересчитанное значение).
-            for field, val in before_snapshot[s].items():
-                pdata[field] = val
-            nick = pdata.get("nickname", "?")
-            lines.append(f"  • {nick}: откат → <b>{pdata.get('elo', 1000)}</b> ELO")
-            return
-
-        # ── Legacy: старые матчи без before_snapshot — считаем по дельте платформы.
+        # Берём точную дельту из снапшота; если старый матч без снапшота — считаем по платформе
         if s in elo_snapshot:
             delta = elo_snapshot[s]
         else:
@@ -5072,18 +4744,14 @@ async def api_match_history(request):
             continue
         won = tg_id in winners
         kd  = m.get("kd_by_uid", {}).get(str(tg_id), [0, 0])
-        elo_delta = m.get("elo_delta", {}).get(str(tg_id))
+        elo_delta = m.get("elo_snapshot", {}).get(str(tg_id))
         if elo_delta is None:
-            legacy_delta = m.get("elo_snapshot", {}).get(str(tg_id))
-            if legacy_delta is not None:
-                # Старый формат хранил только модуль дельты — знак зависел от won/lost.
-                elo_delta = legacy_delta if won else -legacy_delta
-            else:
-                # Совсем старые матчи без какого-либо снапшота ELO — считаем
-                # по текущей формуле начисления, вместо того чтобы показывать +0.
-                platform_fallback = players.get(str(tg_id), {}).get("platform", "pc")
-                win_d_fb, loss_d_fb = elo_deltas_for(platform_fallback)
-                elo_delta = win_d_fb if won else -loss_d_fb
+            # Старые матчи (сыграны до того, как стал сохраняться elo_snapshot)
+            # не хранят точную применённую дельту — считаем её по текущей
+            # формуле начисления ELO, вместо того чтобы показывать +0 ELO.
+            platform_fallback = players.get(str(tg_id), {}).get("platform", "pc")
+            win_d_fb, loss_d_fb = elo_deltas_for(platform_fallback)
+            elo_delta = win_d_fb if won else loss_d_fb
         rows.append({
             "match_id":    m_id,
             "mode":        m.get("mode", "5v5"),
@@ -5091,7 +4759,7 @@ async def api_match_history(request):
             "won":         won,
             "kills":       kd[0] if len(kd) > 0 else 0,
             "deaths":      kd[1] if len(kd) > 1 else 0,
-            "elo_delta":   elo_delta,
+            "elo_delta":   elo_delta if won else -elo_delta,
             "finished_ts": m.get("finished_ts", 0),
             "teammates":   [_nick(u) for u in (winners if won else losers) if u != tg_id],
             "opponents":   [_nick(u) for u in (losers if won else winners)],
