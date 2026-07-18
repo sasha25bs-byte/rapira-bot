@@ -1861,6 +1861,26 @@ def _card_draw_donut(d: ImageDraw.ImageDraw, cx: float, cy: float, r: float,
         ly += 24
 
 
+def _make_gradient(w: int, h: int, c1: tuple, c2: tuple) -> Image.Image:
+    """Диагональный градиент c1 → c2 размером w×h (numpy, быстро)."""
+    import numpy as np
+    x = np.linspace(0.0, 1.0, w)
+    y = np.linspace(0.0, 1.0, h)
+    xx, yy = np.meshgrid(x, y)
+    t = (xx + yy) / 2.0
+    a = np.array(c1, dtype=float)
+    b = np.array(c2, dtype=float)
+    arr = (a[None, None, :] * (1 - t[..., None]) + b[None, None, :] * t[..., None]).astype("uint8")
+    return Image.fromarray(arr, "RGB")
+
+
+def _card_section_title(d: ImageDraw.ImageDraw, x: int, y: int, text: str, font,
+                         accent=(150, 110, 255)):
+    """Заголовок секции с цветным акцентным маркером слева (замена emoji-иконкам)."""
+    d.rounded_rectangle([x, y + 6, x + 6, y + 26], radius=3, fill=accent)
+    d.text((x + 18, y), text, font=font, fill=_CARD_WHITE)
+
+
 def render_stats_card(target: int, out_path: str, group_name: str = "NightFaceit") -> Optional[str]:
     """Рисует PNG-карточку личного профиля игрока с актуальными данными из БД.
     Возвращает out_path, либо None если игрок не зарегистрирован / бот."""
@@ -1923,27 +1943,34 @@ def render_stats_card(target: int, out_path: str, group_name: str = "NightFaceit
     img = Image.new("RGB", (W, H), BG)
     d = ImageDraw.Draw(img)
 
-    # ── ШАПКА ────────────────────────────────────────────────────────────
-    d.rounded_rectangle([24, 24, W - 24, 24 + HEADER_H - 24], radius=18,
-                         fill=(13, 12, 22), outline=(36, 32, 54), width=1)
-    _card_draw_logo_icon(d, 90, 24 + (HEADER_H - 24) / 2, 84)
+    # ── ШАПКА (градиентный баннер, как в референсе) ────────────────────────
+    header_box = [24, 24, W - 24, 24 + HEADER_H - 24]
+    grad_w, grad_h = header_box[2] - header_box[0], header_box[3] - header_box[1]
+    gradient = _make_gradient(grad_w, grad_h, (46, 22, 74), (132, 40, 118))
+    mask = Image.new("L", (grad_w, grad_h), 0)
+    ImageDraw.Draw(mask).rounded_rectangle([0, 0, grad_w - 1, grad_h - 1], radius=18, fill=255)
+    img.paste(gradient, (header_box[0], header_box[1]), mask)
+    d.rounded_rectangle(header_box, radius=18, outline=(150, 90, 160), width=1)
+
+    _card_draw_logo_icon(d, 90, 24 + (HEADER_H - 24) / 2, 84,
+                          bg=(18, 14, 30), border=(210, 190, 255))
     name_y = 24 + (HEADER_H - 24) / 2 - 34
     display_name = p.nickname if len(p.nickname) <= 18 else p.nickname[:17] + "…"
     d.text((150, name_y), display_name, font=f_title, fill=_CARD_WHITE)
-    plat_label = "📱 Мобильный" if p.platform == "mobile" else "🖥 ПК"
-    d.text((150, name_y + 44), f"ID: {p.external_id or '—'}   {plat_label}", font=f_id, fill=_CARD_GRAY)
+    plat_label = "Мобильный" if p.platform == "mobile" else "ПК"
+    d.text((150, name_y + 44), f"ID: {p.external_id or '—'}   {plat_label}", font=f_id, fill=(225, 210, 235))
 
     # логотип NIGHT FACEIT справа
     pill_w = 220
     d.rounded_rectangle([W - 24 - pill_w, 40, W - 24, 40 + 52], radius=14,
-                         fill=(13, 12, 22), outline=(36, 32, 54), width=1)
+                         fill=(18, 14, 26), outline=(150, 90, 160), width=1)
     _card_draw_logo_icon(d, W - 24 - pill_w + 32, 40 + 26, 30)
     d.text((W - 24 - pill_w + 58, 40 + 14), group_name, font=f_logo, fill=_CARD_WHITE)
 
     y = HEADER_H + SECT_GAP - 20
 
     # ── СТАТИСТИКА (заголовок) ──────────────────────────────────────────
-    d.text((24, y), "Статистика", font=f_sect, fill=_CARD_WHITE)
+    _card_section_title(d, 24, y, "Статистика", f_sect)
     y += 44
 
     # три бокса: K/D | Уровень/Калибровка | Winrate
@@ -2021,7 +2048,7 @@ def render_stats_card(target: int, out_path: str, group_name: str = "NightFaceit
     y += INFO_ROW_H + SECT_GAP - 20
 
     # ── СТАТИСТИКА ПО КАРТАМ (без картинки — просто плашка с названием) ──
-    d.text((24, y), "Статистика по картам", font=f_sect, fill=_CARD_WHITE)
+    _card_section_title(d, 24, y, "Статистика по картам", f_sect)
     y += 44
 
     map_name = MAPS_LIST[0] if MAPS_LIST else "Dust 2"
@@ -2053,7 +2080,7 @@ def render_stats_card(target: int, out_path: str, group_name: str = "NightFaceit
     y += MAP_ROW_H + SECT_GAP - 20
 
     # ── ПОСЛЕДНИЕ МАТЧИ ───────────────────────────────────────────────────
-    d.text((24, y), "Последние матчи", font=f_sect, fill=_CARD_WHITE)
+    _card_section_title(d, 24, y, "Последние матчи", f_sect)
     y += 44
     d.rounded_rectangle([24, y, W - 24, y + RECENT_BLOCK_H - 20], radius=16,
                          fill=_CARD_ROW_BG, outline=_CARD_ROW_BORDER, width=1)
