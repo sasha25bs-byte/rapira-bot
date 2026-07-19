@@ -237,7 +237,8 @@ def load_db() -> Dict[str, Any]:
         "players": {}, "match_counter": 0, "active_matches": {},
         "queue_5v5": [], "queue_2v2": [], "lobby_5v5": {}, "lobby_2v2": {}, "muted": {}, "banned": {}, "bot_counter": 0,
         "tickets": {}, "ticket_counter": 0, "user_open_ticket": {},
-        "pending_ocr": {},   # m_id -> распознанный ботом результат матча, ждёт подтверждения админа
+        "pending_ocr": {},      # m_id -> распознанный ботом результат матча, ждёт подтверждения админа
+        "dm_result_wait": {},   # str(uid) -> m_id: игрок нажал «Отправить результат» в ЛС и должен прислать скрин
     }
     if not os.path.exists(DATA_FILE):
         _db_cache = default
@@ -1101,6 +1102,32 @@ async def _announce_lobby_ready(
         except Exception as e:
             print(f"[lobby_ready] не удалось отправить ЛС хосту uid={host_p.user_id}: {e}")
 
+    # ── ЛС каждому реальному игроку матча — кнопка «Отправить результат» ────
+    # После окончания катки игрок жмёт кнопку и присылает скрин прямо в ЛС
+    # боту — бот сам понимает, за какой это матч (см. sendres_/dm_result_wait
+    # и result_dm_photo_handler).
+    for member_uid in (m["ct"] + m["t"]):
+        if _is_bot_uid(member_uid):
+            continue
+        side_tag = "🔵 CT" if member_uid in m["ct"] else "🔴 T"
+        try:
+            await context.bot.send_message(
+                chat_id=member_uid,
+                text=(
+                    f"🎮 <b>Матч #{m_id} собран!</b>\n\n"
+                    f"Сторона: {side_tag}\n"
+                    f"🗺 Карта: <b>{final_map}</b>\n\n"
+                    f"Когда катка закончится — нажми кнопку ниже и пришли "
+                    f"скриншот результата прямо в этот чат."
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("📤 Отправить результат", callback_data=f"sendres_{m_id}")
+                ]]),
+            )
+        except Exception as e:
+            print(f"[lobby_ready] не удалось отправить ЛС игроку uid={member_uid}: {e}")
+
 
 async def start_match(players: List[int], mode: str, db: Dict,
                       context: ContextTypes.DEFAULT_TYPE, chat_id: int,
@@ -1230,6 +1257,7 @@ def main_menu_kb(uid: int, reg: bool) -> InlineKeyboardMarkup:
     ])
     if is_moderator(uid):
         keyboard.append([InlineKeyboardButton("🌙 Команда Faceit", callback_data="cmd_admins")])
+        keyboard.append([InlineKeyboardButton("🧾 Результаты матчей", callback_data="cmd_pending_list")])
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -2957,6 +2985,7 @@ async def resetdb_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "queue_5v5": [], "queue_2v2": [], "lobby_5v5": {}, "lobby_2v2": {},
         "muted": {}, "banned": {}, "bot_counter": 0, "warns": {},
         "tickets": {}, "ticket_counter": 0, "user_open_ticket": {},
+        "pending_ocr": {}, "dm_result_wait": {},
     }
     _db_cache = empty
     with open(DATA_FILE, "w", encoding="utf-8") as f:
@@ -3478,6 +3507,83 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text(text, parse_mode=ParseMode.HTML)
         except Exception:
             await context.bot.send_message(chat_id=q.message.chat_id, text=text, parse_mode=ParseMode.HTML)
+
+        # ── Сразу показываем админу другие незакрытые матчи, если есть ──────
+        remaining = db.get("pending_ocr", {})
+        if remaining:
+            try:
+                await context.bot.send_message(
+                    chat_id=uid,
+                    text=f"🧾 Есть ещё {len(remaining)} матч(ей), ожидающих подтверждения результата:",
+                )
+            except Exception:
+                pass
+            for next_id, next_pending in list(remaining.items())[:3]:
+                next_m = db.get("active_matches", {}).get(next_id)
+                if not next_m:
+                    continue
+                text2, kb2 = _build_ocr_confirm_card(next_id, next_m, next_pending)
+                try:
+                    await context.bot.send_message(chat_id=uid, text=text2, parse_mode=ParseMode.HTML, reply_markup=kb2)
+                except Exception:
+                    pass
+        return
+
+    # ── ИГРОК ЖМЁТ «ОТПРАВИТЬ РЕЗУЛЬТАТ» В ЛС ────────────────────────────────
+    if cb.startswith("sendres_"):
+        m_id = cb.split("_", 1)[1]
+        db = load_db()
+        m = db.get("active_matches", {}).get(m_id)
+        if not m:
+            await q.answer("❌ Матч уже закрыт.", show_alert=True)
+            return
+        all_players = [u for u in (m["ct"] + m["t"]) if not _is_bot_uid(u)]
+        if uid not in all_players:
+            await q.answer("❌ Вы не участник этого матча.", show_alert=True)
+            return
+        db.setdefault("dm_result_wait", {})[str(uid)] = m_id
+        save_db(db)
+        await q.answer()
+        try:
+            await context.bot.send_message(
+                chat_id=uid,
+                text=f"📸 Пришлите скриншот результата матча #{m_id} следующим сообщением прямо сюда.",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        return
+
+    # ── АДМИН/МОД: СПИСОК МАТЧЕЙ, ОЖИДАЮЩИХ ПОДТВЕРЖДЕНИЯ РЕЗУЛЬТАТА ─────────
+    if cb == "cmd_pending_list":
+        if not is_moderator(uid):
+            await q.answer("❌ Недостаточно прав.", show_alert=True)
+            return
+        await q.answer()
+        db = load_db()
+        pending = db.get("pending_ocr", {})
+        if not pending:
+            try:
+                await context.bot.send_message(chat_id=uid, text="✅ Нет матчей, ожидающих подтверждения результата.")
+            except Exception:
+                pass
+            return
+        sent_any = False
+        for m_id, p_data in pending.items():
+            m = db.get("active_matches", {}).get(m_id)
+            if not m:
+                continue
+            text, kb = _build_ocr_confirm_card(m_id, m, p_data)
+            try:
+                await context.bot.send_message(chat_id=uid, text=text, parse_mode=ParseMode.HTML, reply_markup=kb)
+                sent_any = True
+            except Exception:
+                pass
+        if not sent_any:
+            try:
+                await context.bot.send_message(chat_id=uid, text="✅ Нет матчей, ожидающих подтверждения результата.")
+            except Exception:
+                pass
         return
 
     # ── ГЛАВНОЕ МЕНЮ (ЛС) ────────────────────────────────────────────────────
@@ -4497,13 +4603,146 @@ def _match_ocr_to_roster(m: dict, ocr: dict, reporter_uid: Optional[int] = None)
     return kd_by_uid, side_win, unmatched, missing
 
 
+def _build_ocr_confirm_card(m_id: str, m: dict, pending: dict) -> tuple:
+    """
+    Строит (текст, клавиатура) карточки подтверждения распознанного
+    результата матча. Используется и в общем чате, и в ЛС игроку/админу —
+    чтобы карточка выглядела одинаково независимо от источника скрина.
+    """
+    side_win = pending["side"]
+    kd_by_uid = {int(k): tuple(v) for k, v in pending["kd_by_uid"].items()}
+    reporter_uid = pending.get("reported_by")
+
+    win_label = "🔵 CT" if side_win == "ct" else "🔴 T"
+    lines = []
+    for u, (k, d) in kd_by_uid.items():
+        pl = get_player(u)
+        side_tag = "🏆" if (u in m.get(side_win, [])) else "❌"
+        lines.append(f"  {side_tag} {pl.nickname}: {k}/{d}")
+
+    reporter_line = ""
+    if reporter_uid:
+        reporter_line = f"\n\nОт: {get_player(reporter_uid).tg_link()}"
+
+    text = (
+        f"🤖 <b>Матч #{m_id}</b> — распознанный результат по скрину:\n\n"
+        f"Победила сторона: {win_label}\n" + "\n".join(lines) +
+        reporter_line +
+        f"\n\nПроверьте и подтвердите, либо введите вручную через /win."
+    )
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Подтвердить и применить", callback_data=f"ocrwin_confirm:{m_id}"),
+        InlineKeyboardButton("✏️ Ввести вручную",         callback_data=f"ocrwin_manual:{m_id}"),
+    ]])
+    return text, kb
+
+
+async def _process_result_screenshot(m_id: str, m: dict, uid: int, msg, context: ContextTypes.DEFAULT_TYPE, db: Dict[str, Any]):
+    """
+    Общее ядро обработки присланного скрина результата: пробует распознать
+    итог через OCR и либо кладёт карточку подтверждения в pending_ocr
+    (плюс шлёт её в админ-конфу), либо просит администрацию проверить вручную.
+    Используется и при скрине в группе (по подписи с номером матча),
+    и при скрине, присланном игроком в ЛС боту.
+    НЕ отвечает игроку — это делает вызывающий код (там разный текст).
+    """
+    p = get_player(uid)
+    try:
+        ocr_result = None
+        kd_by_uid: Dict[int, tuple] = {}
+        side_win = None
+        unmatched: List[str] = []
+        missing: List[str] = []
+        try:
+            photo_file = await msg.photo[-1].get_file()
+            photo_bytes = bytes(await photo_file.download_as_bytearray())
+            ocr_result = parse_scoreboard_ocr(photo_bytes)
+            if ocr_result:
+                kd_by_uid, side_win, unmatched, missing = _match_ocr_to_roster(m, ocr_result, reporter_uid=uid)
+        except Exception as e:
+            print(f"[result] ocr error: {e!r}")
+            ocr_result = None
+
+        if ADMIN_GROUP_ID:
+            try:
+                await context.bot.forward_message(
+                    chat_id=ADMIN_GROUP_ID,
+                    from_chat_id=msg.chat_id,
+                    message_id=msg.message_id,
+                )
+            except Exception as e:
+                print(f"[result] admin forward error: {e!r}")
+
+        ocr_ok = bool(ocr_result) and side_win is not None and not unmatched and not missing and len(kd_by_uid) >= 2
+
+        if not ocr_ok:
+            reasons = []
+            if not _ocr_available():
+                reasons.append("на сервере не настроен OCR (tesseract не найден — проверь Aptfile/requirements.txt на Railway)")
+            elif not ocr_result:
+                reasons.append("не нашёл таблицу на скрине (плохой ракурс/качество/не тот интерфейс)")
+            else:
+                if side_win is None:
+                    reasons.append("не разобрал счёт команд")
+                if unmatched:
+                    reasons.append("есть нераспознанные/чужие ID: " + ", ".join(unmatched))
+                if missing:
+                    reasons.append("не нашёл строку для: " + ", ".join(missing))
+            if ADMIN_GROUP_ID:
+                await context.bot.send_message(
+                    chat_id=ADMIN_GROUP_ID,
+                    text=(
+                        f"📸 Скрин результатов матча #{m_id}\n"
+                        f"От: {p.tg_link()}\n\n"
+                        f"⚠️ Бот не смог уверенно распознать результат автоматически "
+                        f"({'; '.join(reasons) if reasons else 'неизвестная причина'}).\n"
+                        f"Проверьте вручную и введите <code>/win {m_id} ct|t ...</code>."
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+            return
+
+        # ── Уверенно распознали — кладём в очередь на подтверждение админом ──
+        db.setdefault("pending_ocr", {})[m_id] = {
+            "side":        side_win,
+            "kd_by_uid":   {str(k): list(v) for k, v in kd_by_uid.items()},
+            "reported_by": uid,
+        }
+        save_db(db)
+
+        text, kb = _build_ocr_confirm_card(m_id, m, db["pending_ocr"][m_id])
+        if ADMIN_GROUP_ID:
+            await context.bot.send_message(
+                chat_id=ADMIN_GROUP_ID, text=text, parse_mode=ParseMode.HTML, reply_markup=kb,
+            )
+    except Exception as e:
+        # Подстраховка: если где-то в блоке выше что-то пошло не так и
+        # не было поймано локально — не даём ошибке пройти полностью молча.
+        # Печатаем traceback в лог Railway И пытаемся всё равно уведомить
+        # админ-группу, чтобы результат не потерялся без следа.
+        import traceback
+        traceback.print_exc()
+        if ADMIN_GROUP_ID:
+            try:
+                await context.bot.send_message(
+                    chat_id=ADMIN_GROUP_ID,
+                    text=(
+                        f"⚠️ Ошибка при обработке скрина матча #{m_id}: <code>{e!r}</code>\n"
+                        f"Проверьте вручную и введите <code>/win {m_id} ct|t ...</code>."
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception as e2:
+                print(f"[result] даже фолбэк-уведомление не отправилось: {e2!r}")
+
+
 async def scoreboard_photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Игрок присылает в группу скриншот результатов с подписью, где есть номер матча
     (например: фото + подпись "3" или "матч 3").
-    Без ИИ: бот просто проверяет, что отправитель — участник этого матча,
-    пересылает скрин в админ-конфу на ручную проверку и просит сдать
-    результат командой /result.
+    Бот проверяет, что отправитель — участник этого матча, пробует
+    распознать результат через OCR (см. _process_result_screenshot) и
+    пересылает скрин в админ-конфу на проверку.
     """
     msg = update.message
     if not msg or not msg.photo:
@@ -4529,7 +4768,6 @@ async def scoreboard_photo_handler(update: Update, context: ContextTypes.DEFAULT
         await msg.reply_text("❌ Вы не участник этого матча — скрин не принят.")
         return
 
-    p = get_player(uid)
     await msg.reply_text(
         f"📸 Скриншот игры #{m_id} принят.\n\n"
         f"Ожидайте, когда администрация Night Faceit зарегает вам игру.\n\n"
@@ -4537,112 +4775,77 @@ async def scoreboard_photo_handler(update: Update, context: ContextTypes.DEFAULT
         parse_mode=ParseMode.HTML,
     )
 
-    if not ADMIN_GROUP_ID:
+    await _process_result_screenshot(m_id, m, uid, msg, context, db)
+
+
+async def result_dm_photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Скриншот результата, присланный игроком боту в ЛС.
+
+    Номер матча бот определяет сам, без ввода от игрока:
+      1. Если игрок недавно нажал кнопку «📤 Отправить результат» под
+         сообщением о собранном лобби — берём матч оттуда (dm_result_wait).
+      2. Иначе, если в подписи к фото есть число — считаем его номером матча.
+      3. Иначе смотрим, в скольких активных матчах участвует этот игрок:
+         если ровно в одном — берём его; если в нескольких — просим
+         прислать скрин ещё раз с номером матча в подписи.
+    Если ни один из вариантов не сработал (игрок вообще не в активных
+    матчах) — не трогаем сообщение, чтобы не мешать транслятору тикетов.
+    """
+    msg = update.message
+    if not msg or not msg.photo:
         return
 
-    try:
-        # ── Пробуем распознать результат сами (OCR) ──────────────────────
-        ocr_result = None
-        kd_by_uid: Dict[int, tuple] = {}
-        side_win = None
-        unmatched: List[str] = []
-        missing: List[str] = []
-        try:
-            photo_file = await msg.photo[-1].get_file()
-            photo_bytes = bytes(await photo_file.download_as_bytearray())
-            ocr_result = parse_scoreboard_ocr(photo_bytes)
-            if ocr_result:
-                kd_by_uid, side_win, unmatched, missing = _match_ocr_to_roster(m, ocr_result, reporter_uid=uid)
-        except Exception as e:
-            print(f"[scoreboard] ocr error: {e!r}")
-            ocr_result = None
+    uid = update.effective_user.id
+    db  = load_db()
 
-        try:
-            await context.bot.forward_message(
-                chat_id=ADMIN_GROUP_ID,
-                from_chat_id=msg.chat_id,
-                message_id=msg.message_id,
-            )
-        except Exception as e:
-            print(f"[scoreboard] admin forward error: {e!r}")
-
-        ocr_ok = bool(ocr_result) and side_win is not None and not unmatched and not missing and len(kd_by_uid) >= 2
-
-        if not ocr_ok:
-            reasons = []
-            if not _ocr_available():
-                reasons.append("на сервере не настроен OCR (tesseract не найден — проверь Aptfile/requirements.txt на Railway)")
-            elif not ocr_result:
-                reasons.append("не нашёл таблицу на скрине (плохой ракурс/качество/не тот интерфейс)")
-            else:
-                if side_win is None:
-                    reasons.append("не разобрал счёт команд")
-                if unmatched:
-                    reasons.append("есть нераспознанные/чужие ID: " + ", ".join(unmatched))
-                if missing:
-                    reasons.append("не нашёл строку для: " + ", ".join(missing))
-            await context.bot.send_message(
-                chat_id=ADMIN_GROUP_ID,
-                text=(
-                    f"📸 Скрин результатов матча #{m_id}\n"
-                    f"От: <a href=\"tg://user?id={uid}\">{p.nickname}</a>\n\n"
-                    f"⚠️ Бот не смог уверенно распознать результат автоматически "
-                    f"({'; '.join(reasons) if reasons else 'неизвестная причина'}).\n"
-                    f"Проверьте вручную и введите <code>/win {m_id} ct|t ...</code>."
-                ),
-                parse_mode=ParseMode.HTML,
-            )
-            return
-
-        # ── Уверенно распознали — предлагаем админу подтвердить одной кнопкой ──
-        db["pending_ocr"][m_id] = {
-            "side":       side_win,
-            "kd_by_uid":  {str(k): list(v) for k, v in kd_by_uid.items()},
-            "reported_by": uid,
-        }
+    m_id = db.get("dm_result_wait", {}).pop(str(uid), None)
+    if m_id is not None:
         save_db(db)
 
-        win_label = "🔵 CT" if side_win == "ct" else "🔴 T"
-        lines = []
-        for u, (k, d) in kd_by_uid.items():
-            pl = get_player(u)
-            side_tag = "🏆" if (u in m.get(side_win, [])) else "❌"
-            lines.append(f"  {side_tag} {pl.nickname}: {k}/{d}")
+    caption = msg.caption or ""
+    cap_num = re.search(r"\d+", caption)
+    if not m_id and cap_num:
+        m_id = cap_num.group(0)
 
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Подтвердить и применить", callback_data=f"ocrwin_confirm:{m_id}"),
-            InlineKeyboardButton("✏️ Ввести вручную",         callback_data=f"ocrwin_manual:{m_id}"),
-        ]])
-
-        await context.bot.send_message(
-            chat_id=ADMIN_GROUP_ID,
-            text=(
-                f"🤖 <b>Матч #{m_id}</b> — бот распознал результат по скрину:\n\n"
-                f"Победила сторона: {win_label}\n" + "\n".join(lines) +
-                f"\n\nОт: <a href=\"tg://user?id={uid}\">{p.nickname}</a>\n\n"
-                f"Проверьте и подтвердите, либо введите вручную через /win."
-            ),
-            parse_mode=ParseMode.HTML,
-            reply_markup=kb,
-        )
-    except Exception as e:
-        # Подстраховка: если где-то в блоке выше что-то пошло не так и
-        # не было поймано локально — не даём ошибке пройти полностью молча.
-        # Печатаем traceback в лог Railway И пытаемся всё равно уведомить
-        # админ-группу, чтобы результат не потерялся без следа.
-        import traceback
-        traceback.print_exc()
-        try:
-            await context.bot.send_message(
-                chat_id=ADMIN_GROUP_ID,
-                text=(
-                    f"⚠️ Ошибка при обработке скрина матча #{m_id}: <code>{e!r}</code>\n"
-                    f"Проверьте вручную и введите <code>/win {m_id} ct|t ...</code>."
-                ),
+    if not m_id:
+        candidates = [
+            mid for mid, mm in db.get("active_matches", {}).items()
+            if uid in (mm.get("ct", []) + mm.get("t", []))
+        ]
+        if len(candidates) == 1:
+            m_id = candidates[0]
+        elif len(candidates) > 1:
+            await msg.reply_text(
+                "❓ Вы участвуете в нескольких матчах одновременно.\n"
+                "Пришлите скрин ещё раз с подписью — номером нужного матча, например: <code>14</code>.",
                 parse_mode=ParseMode.HTML,
             )
-        except Exception as e2:
-            print(f"[scoreboard] даже фолбэк-уведомление не отправилось: {e2!r}")
+            raise ApplicationHandlerStop
+        else:
+            # Игрок не участник ни одного активного матча — не наш кейс,
+            # пусть фото уйдёт в обычный транслятор тикетов.
+            return
+
+    m = db.get("active_matches", {}).get(m_id)
+    if not m:
+        await msg.reply_text(f"❌ Матч #{m_id} не найден или уже закрыт.")
+        raise ApplicationHandlerStop
+
+    all_players = [u for u in (m["ct"] + m["t"]) if not _is_bot_uid(u)]
+    if uid not in all_players:
+        await msg.reply_text("❌ Вы не участник этого матча — скрин не принят.")
+        raise ApplicationHandlerStop
+
+    await msg.reply_text(
+        f"📸 Скриншот матча #{m_id} принят.\n\n"
+        f"Ожидайте, когда администрация Night Faceit зарегает вам игру.\n\n"
+        f"Спасибо что выбрали наш фейсит 🌙",
+        parse_mode=ParseMode.HTML,
+    )
+
+    await _process_result_screenshot(m_id, m, uid, msg, context, db)
+    raise ApplicationHandlerStop
 
 
 # ════════════════════════════════════════════════
@@ -5045,6 +5248,21 @@ async def win_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         + ("\n".join(loss_lines) if loss_lines else "  (нет реальных игроков)")
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+    # ── Если есть другие матчи, ожидающие подтверждения результата, —
+    # сразу подсказываем об этом админу, закрывшему катку.
+    remaining = db.get("pending_ocr", {})
+    if remaining:
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_user.id,
+                text=(
+                    f"🧾 Есть ещё {len(remaining)} матч(ей), ожидающих подтверждения результата.\n"
+                    f"Открой кнопку «🧾 Результаты матчей» в /start, чтобы их разобрать."
+                ),
+            )
+        except Exception:
+            pass
 
 
 async def cancelwin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6119,6 +6337,13 @@ async def run_bot():
     app.add_handler(MessageHandler(
         filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND,
         reg_dm_text_handler,
+    ), group=-1)
+
+    # Скрины результатов матчей, присланные игроками в ЛС боту — до
+    # транслятора тикетов, чтобы такие фото не улетали в тему поддержки.
+    app.add_handler(MessageHandler(
+        filters.PHOTO & filters.ChatType.PRIVATE,
+        result_dm_photo_handler,
     ), group=-1)
 
     # Транслятор тикетов: НЕ-командные текст/фото в личке боту —
