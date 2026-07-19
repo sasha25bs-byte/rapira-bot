@@ -145,9 +145,9 @@ class Player:
     user_id:       int
     nickname:      str
     external_id:   str   = ""
-    elo:           int   = 1000
-    elo_5v5:       int   = 1000
-    elo_2v2:       int   = 1000
+    elo:           int   = 0
+    elo_5v5:       int   = 0
+    elo_2v2:       int   = 0
     wins:          int   = 0
     losses:        int   = 0
     wins_5v5:      int   = 0
@@ -341,7 +341,7 @@ def _safe_num(d: dict, key: str, default):
 
 
 _PLAYER_NUMERIC_DEFAULTS = {
-    "elo": 1000, "elo_5v5": 1000, "elo_2v2": 1000,
+    "elo": 0, "elo_5v5": 0, "elo_2v2": 0,
     "wins": 0, "losses": 0, "wins_5v5": 0, "losses_5v5": 0,
     "wins_2v2": 0, "losses_2v2": 0,
     "avg": 0.0, "avg_5v5": 0.0, "avg_2v2": 0.0,
@@ -384,7 +384,7 @@ def get_player(uid: int, name: str = "Player") -> Player:
         save_db(db)
     d = db["players"][s]
     for field, val in [("wins",0),("losses",0),("avg",0.0),
-                       ("elo",1000),("elo_5v5",1000),("elo_2v2",1000),
+                       ("elo",0),("elo_5v5",0),("elo_2v2",0),
                        ("wins_5v5",0),("losses_5v5",0),
                        ("wins_2v2",0),("losses_2v2",0),
                        ("avg_5v5",0.0),("avg_2v2",0.0),
@@ -1493,8 +1493,8 @@ def build_stats_text(target: int, looking_at_self: bool, private_chat: bool = Tr
         return ("❌ Этот пользователь не зарегистрирован.", None)
 
     d = db["players"][s]
-    for field, val in [("wins",0),("losses",0),("avg",0.0),("elo",1000),
-                       ("elo_5v5",1000),("elo_2v2",1000),
+    for field, val in [("wins",0),("losses",0),("avg",0.0),("elo",0),
+                       ("elo_5v5",0),("elo_2v2",0),
                        ("wins_5v5",0),("losses_5v5",0),
                        ("wins_2v2",0),("losses_2v2",0),
                        ("avg_5v5",0.0),("avg_2v2",0.0),
@@ -1741,8 +1741,8 @@ def build_top_players(limit: int = 10) -> List[Player]:
     for d in db["players"].values():
         try:
             if not d.get("external_id") or d.get("is_bot"): continue
-            for field, val in [("wins", 0), ("losses", 0), ("avg", 0.0), ("elo", 1000),
-                                ("elo_5v5", 1000), ("elo_2v2", 1000),
+            for field, val in [("wins", 0), ("losses", 0), ("avg", 0.0), ("elo", 0),
+                                ("elo_5v5", 0), ("elo_2v2", 0),
                                 ("wins_5v5", 0), ("losses_5v5", 0),
                                 ("wins_2v2", 0), ("losses_2v2", 0),
                                 ("avg_5v5", 0.0), ("avg_2v2", 0.0),
@@ -1750,7 +1750,7 @@ def build_top_players(limit: int = 10) -> List[Player]:
                                 ("total_kills", 0), ("total_deaths", 0),
                                 ("platform", "pc")]:
                 d.setdefault(field, val)
-            d["elo"] = max(_safe_num(d, "elo", 1000), _safe_num(d, "elo_5v5", 1000), _safe_num(d, "elo_2v2", 1000))
+            d["elo"] = max(_safe_num(d, "elo", 0), _safe_num(d, "elo_5v5", 0), _safe_num(d, "elo_2v2", 0))
             p = _make_player(d)
             if not p.is_calibrated:
                 continue
@@ -1871,7 +1871,11 @@ def compute_recent_matches(uid: int, limit: int = 5) -> List[Dict[str, Any]]:
             continue
         won = uid in winners
         elo_snap = m.get("elo_snapshot", {}) or {}
-        delta = elo_snap.get(s_uid)
+        raw_delta = elo_snap.get(s_uid)
+        if isinstance(raw_delta, dict):
+            delta = raw_delta.get("elo_after", 0) - raw_delta.get("elo_before", 0)
+        else:
+            delta = raw_delta if (raw_delta is None or won) else -raw_delta
         rows.append({
             "match_id": m_id,
             "mode": m.get("mode", "?"),
@@ -1893,9 +1897,15 @@ def _card_draw_donut(d: ImageDraw.ImageDraw, cx: float, cy: float, r: float,
     pct = max(0.0, min(1.0, pct))
     if pct > 0:
         d.arc(bbox, -90, -90 + 360 * pct, fill=ring_color, width=8)
-    tb = d.textbbox((0, 0), label, font=font_big)
+    # Максимальная ширина текста внутри кольца — с запасом от внутреннего края,
+    # иначе длинные значения вроде "100%" вылезают за пределы кружка.
+    max_label_w = r * 1.5
+    base_size = getattr(font_big, "size", 30)
+    fit_font = _card_fit_font(d, label, max_label_w, base_size, min_size=12,
+                               bold=("Bold" in getattr(font_big, "path", "DejaVuSans-Bold.ttf")))
+    tb = d.textbbox((0, 0), label, font=fit_font)
     tw, th = tb[2] - tb[0], tb[3] - tb[1]
-    d.text((cx - tw / 2 - tb[0], cy - th / 2 - tb[1]), label, font=font_big, fill=_CARD_WHITE)
+    d.text((cx - tw / 2 - tb[0], cy - th / 2 - tb[1]), label, font=fit_font, fill=_CARD_WHITE)
     ly = cy + r + 14
     for line in sub_lines:
         lb = d.textbbox((0, 0), line, font=font_small)
@@ -1930,6 +1940,21 @@ def _card_section_title(d: ImageDraw.ImageDraw, x: int, y: int, text: str, font,
 
 
 # ── ХЕЛПЕРЫ ДЛЯ НОВОЙ ВЁРСТКИ /stats ──────────────────────────────────────
+
+def _card_fit_font(d: ImageDraw.ImageDraw, text: str, max_w: float, base_size: int,
+                    min_size: int = 12, bold: bool = True):
+    """Подбирает самый крупный размер шрифта (от base_size вниз до min_size),
+    при котором text не шире max_w. Не даёт длинным значениям («Мобильный»,
+    «100%» и т.п.) вылезать за края своих блоков/кружков."""
+    size = base_size
+    while size > min_size:
+        f = _card_font(size, bold=bold)
+        tb = d.textbbox((0, 0), text, font=f)
+        if (tb[2] - tb[0]) <= max_w:
+            return f
+        size -= 1
+    return _card_font(min_size, bold=bold)
+
 
 def _card_center_text(d: ImageDraw.ImageDraw, cx: float, cy: float, text: str, font, fill):
     """Рисует текст, центрированный по (cx, cy). Возвращает (ширина, высота)."""
@@ -1973,7 +1998,9 @@ def _card_stat_col(d: ImageDraw.ImageDraw, x: float, w: float, y: float, label: 
     """Одна колонка в 3-колоночной строке статистики (label сверху, value снизу, по центру)."""
     cx = x + w / 2
     _card_center_text(d, cx, y, label, f_lb, _CARD_GRAY)
-    _card_center_text(d, cx, y + 22, value, f_val, val_color)
+    base_size = getattr(f_val, "size", 21)
+    fit_val_font = _card_fit_font(d, value, w - 10, base_size, min_size=12)
+    _card_center_text(d, cx, y + 22, value, fit_val_font, val_color)
 
 
 def _card_leaderboard_row(d: ImageDraw.ImageDraw, x: float, w: float, y: float,
@@ -2012,15 +2039,28 @@ def _card_recent_row(d: ImageDraw.ImageDraw, x: float, w: float, y: float, h: fl
 
 
 def _card_find_map_image(map_name: str) -> Optional[str]:
-    """Ищет локальную картинку карты в папке maps/ рядом со скриптом
-    (maps/dust2.jpg и т.п.). Если её нет — вызывающий код рисует плейсхолдер,
-    карточка не ломается."""
+    """Ищет локальную картинку карты — сначала в папке maps/ рядом со скриптом
+    (maps/dust2.jpg), а если её там нет — прямо в корне репозитория, рядом
+    с самим Night_Faceit.py (dust2.jpg). Если нигде не нашли — вызывающий код
+    рисует плейсхолдер, карточка не ломается."""
     slug = re.sub(r"[^a-z0-9]+", "", map_name.lower())
-    base = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "maps")
-    for ext in (".jpg", ".jpeg", ".png", ".webp"):
-        p = _os.path.join(base, slug + ext)
-        if _os.path.exists(p):
-            return p
+    script_dir = _os.path.dirname(_os.path.abspath(__file__))
+    search_dirs = [_os.path.join(script_dir, "maps"), script_dir]
+    exts = (".jpg", ".jpeg", ".png", ".webp", ".JPG", ".JPEG", ".PNG", ".WEBP")
+
+    for base in search_dirs:
+        for ext in exts:
+            p = _os.path.join(base, slug + ext)
+            if _os.path.exists(p):
+                return p
+
+    # Ничего не нашли — печатаем, что именно искали, чтобы было видно в логах
+    # (Railway/консоль), почему на карточке плейсхолдер вместо фото карты.
+    print(f"⚠️ Картинка карты не найдена: искал '{slug}.(jpg|jpeg|png|webp)' в {search_dirs}")
+    try:
+        print(f"   Содержимое папки со скриптом ({script_dir}): {_os.listdir(script_dir)}")
+    except Exception as e:
+        print(f"   Не удалось прочитать папку со скриптом: {e!r}")
     return None
 
 
@@ -2050,7 +2090,8 @@ def _card_map_panel(img: Image.Image, d: ImageDraw.ImageDraw, x0: float, y0: flo
     if path:
         try:
             photo = _card_cover_crop(Image.open(path).convert("RGB"), w, h).convert("RGBA")
-        except Exception:
+        except Exception as e:
+            print(f"⚠️ Нашёл файл карты {path}, но не смог его открыть/обработать: {e!r}")
             photo = None
     if photo is None:
         photo = _make_gradient(w, h, (26, 19, 42), (54, 30, 66)).convert("RGBA")
@@ -2124,8 +2165,8 @@ def render_stats_card(target: int, out_path: str, group_name: str = "NightFaceit
         return None
 
     d_raw = db["players"][s]
-    for field, val in [("wins", 0), ("losses", 0), ("avg", 0.0), ("elo", 1000),
-                        ("elo_5v5", 1000), ("elo_2v2", 1000),
+    for field, val in [("wins", 0), ("losses", 0), ("avg", 0.0), ("elo", 0),
+                        ("elo_5v5", 0), ("elo_2v2", 0),
                         ("wins_5v5", 0), ("losses_5v5", 0),
                         ("wins_2v2", 0), ("losses_2v2", 0),
                         ("avg_5v5", 0.0), ("avg_2v2", 0.0),
@@ -2134,7 +2175,7 @@ def render_stats_card(target: int, out_path: str, group_name: str = "NightFaceit
                         ("total_kills", 0), ("total_deaths", 0),
                         ("platform", "pc"), ("registered_ts", 0.0)]:
         d_raw.setdefault(field, val)
-    d_raw["elo"] = max(_safe_num(d_raw, "elo", 1000), _safe_num(d_raw, "elo_5v5", 1000), _safe_num(d_raw, "elo_2v2", 1000))
+    d_raw["elo"] = max(_safe_num(d_raw, "elo", 0), _safe_num(d_raw, "elo_5v5", 0), _safe_num(d_raw, "elo_2v2", 0))
 
     try:
         p = _make_player(d_raw)
@@ -2317,11 +2358,14 @@ def render_stats_card(target: int, out_path: str, group_name: str = "NightFaceit
     for bx0 in (MARGIN, MARGIN + row_w + GAP):
         d.rounded_rectangle([bx0, yl, bx0 + row_w, yl + row2_h], radius=16,
                              fill=_CARD_ROW_BG, outline=_CARD_ROW_BORDER, width=1)
+    wl_avail_w = row_w - 40
     d.text((MARGIN + 20, yl + 16), "5v5", font=f_box_lb, fill=_CARD_GRAY)
-    d.text((MARGIN + 20, yl + 44), f"{p.wins_5v5}W / {p.losses_5v5}L", font=f_box_val, fill=_CARD_WHITE)
+    wl5_txt = f"{p.wins_5v5}W / {p.losses_5v5}L"
+    d.text((MARGIN + 20, yl + 44), wl5_txt, font=_card_fit_font(d, wl5_txt, wl_avail_w, 29), fill=_CARD_WHITE)
     bx2 = MARGIN + row_w + GAP
     d.text((bx2 + 20, yl + 16), "2v2", font=f_box_lb, fill=_CARD_GRAY)
-    d.text((bx2 + 20, yl + 44), f"{p.wins_2v2}W / {p.losses_2v2}L", font=f_box_val, fill=_CARD_WHITE)
+    wl2_txt = f"{p.wins_2v2}W / {p.losses_2v2}L"
+    d.text((bx2 + 20, yl + 44), wl2_txt, font=_card_fit_font(d, wl2_txt, wl_avail_w, 29), fill=_CARD_WHITE)
 
     yl += row2_h + 34
 
@@ -2396,13 +2440,20 @@ def render_stats_card(target: int, out_path: str, group_name: str = "NightFaceit
     def _tick(x, y, color=_CARD_PURPLE_LIT):
         d.rounded_rectangle([x, y + 3, x + 4, y + 15], radius=2, fill=color)
 
+    # Ширина колонки минус отступ до следующей — long "Мобильный"/число матчей
+    # больше не наезжают друг на друга.
+    col_avail_w = half_w - 30
+
     _tick(RIGHT_X + 20, yr + 20)
     d.text((RIGHT_X + 32, yr + 18), "Устройство", font=f_box_lb, fill=_CARD_GRAY)
-    d.text((RIGHT_X + 20, yr + 44), plat_label, font=f_box_val, fill=_CARD_WHITE)
+    plat_font = _card_fit_font(d, plat_label, col_avail_w, 29)
+    d.text((RIGHT_X + 20, yr + 44), plat_label, font=plat_font, fill=_CARD_WHITE)
 
     _tick(RIGHT_X + half_w + 10, yr + 20)
     d.text((RIGHT_X + half_w + 22, yr + 18), "Матчей", font=f_box_lb, fill=_CARD_GRAY)
-    d.text((RIGHT_X + half_w + 10, yr + 44), f"{total_games:,}", font=f_box_val, fill=_CARD_WHITE)
+    matches_txt2 = f"{total_games:,}"
+    matches_font = _card_fit_font(d, matches_txt2, col_avail_w, 29)
+    d.text((RIGHT_X + half_w + 10, yr + 44), matches_txt2, font=matches_font, fill=_CARD_WHITE)
 
     reg_label = (datetime.fromtimestamp(p.registered_ts).strftime("%d.%m.%Y")
                  if getattr(p, "registered_ts", 0) else "—")
@@ -2710,7 +2761,9 @@ RULES_TEXT = (
     "⚠️ Чужой ID или неверная платформа — <b>бан</b>.\n\n"
     "━━━━━━━━━━━━━━\n\n"
     "<b>📊 ЭЛО И УРОВНИ</b>\n"
-    "Старт: 1000 ЭЛО | Минимум: 100 ЭЛО\n\n"
+    f"Первые {CALIBRATION_GAMES} матчей — калибровка (ранг скрыт, ЭЛО не меняется).\n"
+    "По итогам калибровки бот сам выдаёт стартовый ранг по результатам этих игр.\n"
+    "Минимум ЭЛО после калибровки: 100\n\n"
     "💻 ПК — победа <b>+15</b> / поражение <b>−30</b>\n"
     "📱 Мобайл — победа <b>+25</b> / поражение <b>−20</b>\n\n"
     "⚪ LVL 1 → до 500\n"
@@ -3191,6 +3244,31 @@ async def _menu_edit(q, text: str, kb: Optional[InlineKeyboardMarkup] = None) ->
             pass
 
 
+async def _menu_send_photo(q, photo_path: str, kb: Optional[InlineKeyboardMarkup] = None) -> None:
+    """Аналог _menu_edit, но для PNG-карточек. Telegram не даёт превратить
+    текстовое сообщение в фото через edit_message_*, поэтому старое сообщение
+    меню удаляется, а новая карточка отправляется отдельным сообщением."""
+    chat = q.message.chat if q.message else None
+    try:
+        if q.message:
+            await q.message.delete()
+    except Exception:
+        pass
+    try:
+        with open(photo_path, "rb") as f:
+            if chat:
+                await chat.send_photo(photo=f, reply_markup=kb)
+            elif q.message:
+                await q.message.reply_photo(photo=f, reply_markup=kb)
+    except Exception as e:
+        print(f"⚠️ Не удалось отправить фото-карточку меню: {e!r}")
+    finally:
+        try:
+            os.remove(photo_path)
+        except OSError:
+            pass
+
+
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q   = update.callback_query
     uid = q.from_user.id
@@ -3269,16 +3347,45 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text, kb = build_stats_text(uid, True, private_chat)
         rows = list(kb.inline_keyboard) if kb else []
         rows.append([InlineKeyboardButton("⬅️ В главное меню", callback_data="cmd_menu")])
-        await _menu_edit(q, text, InlineKeyboardMarkup(rows))
+        back_kb = InlineKeyboardMarkup(rows)
+
+        card_path = _os.path.join(
+            _os.path.dirname(_os.path.abspath(__file__)),
+            f"_stats_card_{uid}_{q.message.chat.id if q.message else uid}.png"
+        )
+        result = None
+        try:
+            result = render_stats_card(uid, card_path)
+        except Exception as e:
+            print(f"⚠️ Не удалось сгенерировать карточку профиля (кнопка) uid={uid}: {e!r}")
+            result = None
+
+        if result:
+            await _menu_send_photo(q, result, back_kb)
+        else:
+            await _menu_edit(q, text, back_kb)
         return
 
     # ── ТОП ИГРОКОВ ───────────────────────────────────────────────────────────
     if cb == "cmd_top":
         await q.answer()
-        await _menu_edit(
-            q, build_top_text(),
-            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ В главное меню", callback_data="cmd_menu")]])
+        back_kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ В главное меню", callback_data="cmd_menu")]])
+
+        card_path = _os.path.join(
+            _os.path.dirname(_os.path.abspath(__file__)),
+            f"_top_card_{q.message.chat.id if q.message else uid}.png"
         )
+        result = None
+        try:
+            result = render_top_card(card_path)
+        except Exception as e:
+            print(f"⚠️ Не удалось сгенерировать карточку топа (кнопка): {e!r}")
+            result = None
+
+        if result:
+            await _menu_send_photo(q, result, back_kb)
+        else:
+            await _menu_edit(q, build_top_text(), back_kb)
         return
 
     # ── СЕЗОН ─────────────────────────────────────────────────────────────────
@@ -3433,8 +3540,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         players = []
         for d in db["players"].values():
             if not d.get("external_id") or d.get("is_bot"): continue
-            for field, val in [("wins",0),("losses",0),("avg",0.0),("elo",1000),
-                               ("elo_5v5",1000),("elo_2v2",1000),
+            for field, val in [("wins",0),("losses",0),("avg",0.0),("elo",0),
+                               ("elo_5v5",0),("elo_2v2",0),
                                ("wins_5v5",0),("losses_5v5",0),
                                ("wins_2v2",0),("losses_2v2",0),
                                ("avg_5v5",0.0),("avg_2v2",0.0),
@@ -4232,6 +4339,7 @@ async def win_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     win_lines:  List[str] = []
     loss_lines: List[str] = []
+    elo_snapshot: Dict[str, dict] = {}
 
     def _apply(target_uid: int, won: bool, lines: List[str]) -> None:
         if _is_bot_uid(target_uid):
@@ -4243,10 +4351,19 @@ async def win_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         platform      = pdata.get("platform", "pc")
         win_d, loss_d = elo_deltas_for(platform)
-        delta         = win_d if won else -loss_d
 
-        for field in ("elo", f"elo_{mode}"):
-            pdata[field] = max(ELO_MIN, pdata.get(field, 1000) + delta)
+        elo_before      = pdata.get("elo", 0)
+        elo_mode_before = pdata.get(f"elo_{mode}", 0)
+        games_before     = pdata.get("wins", 0) + pdata.get("losses", 0)
+        was_calibrated   = games_before >= CALIBRATION_GAMES
+
+        # Во время калибровки ЭЛО не начисляется и не списывается — игрок
+        # копит только W/L, а стартовый ранг ему присвоит бот по итогам всех
+        # калибровочных матчей (см. ниже). После калибровки — обычное начисление.
+        if was_calibrated:
+            delta = win_d if won else -loss_d
+            for field, before in (("elo", elo_before), (f"elo_{mode}", elo_mode_before)):
+                pdata[field] = max(ELO_MIN, before + delta)
 
         if won:
             pdata["wins"]            = pdata.get("wins", 0) + 1
@@ -4260,20 +4377,50 @@ async def win_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pdata["avg"]          = round(w / (w + l) * 100, 1) if (w + l) else 0.0
         pdata[f"avg_{mode}"]  = round(wm / (wm + lm) * 100, 1) if (wm + lm) else 0.0
 
+        games_after    = w + l
+        calib_done_now = (not was_calibrated) and games_after >= CALIBRATION_GAMES
+        start_elo      = None
+        if calib_done_now:
+            # Калибровка только что завершилась этим матчем — бот сам решает
+            # стартовый ранг по проценту побед за все калибровочные матчи.
+            win_rate  = (w / games_after) if games_after else 0.0
+            start_elo = int(round(ELO_MIN + win_rate * (2000 - ELO_MIN)))
+            pdata["elo"]         = start_elo
+            pdata[f"elo_{mode}"] = start_elo
+
         # ── Киллы/смерти за матч → накопительный средний KD ────────────────
         kills, deaths = kd_by_uid.get(target_uid, (0, 0))
         pdata["total_kills"]  = pdata.get("total_kills", 0) + kills
         pdata["total_deaths"] = pdata.get("total_deaths", 0) + deaths
         total_kd = round(pdata["total_kills"] / pdata["total_deaths"], 2) if pdata["total_deaths"] else float(pdata["total_kills"])
 
-        nick = pdata.get("nickname", "?")
-        sign = "+" if won else "-"
-        applied = win_d if won else loss_d
-        lines.append(
-            f"  • {nick}: {sign}{applied} ELO → <b>{pdata['elo']}</b> | "
+        nick   = pdata.get("nickname", "?")
+        kd_txt = (
             f"{kills}/{deaths} (KD матча {round(kills/deaths, 2) if deaths else kills}) | "
             f"общий KD: <b>{total_kd}</b>"
         )
+
+        if calib_done_now:
+            lines.append(
+                f"  • {nick}: 🔄→✅ <b>калибровка завершена!</b> Стартовый ранг: <b>{start_elo}</b> ELO | {kd_txt}"
+            )
+        elif was_calibrated:
+            sign    = "+" if won else "-"
+            applied = win_d if won else loss_d
+            lines.append(
+                f"  • {nick}: {sign}{applied} ELO → <b>{pdata['elo']}</b> | {kd_txt}"
+            )
+        else:
+            lines.append(
+                f"  • {nick}: 🔄 калибровочный матч ({games_after}/{CALIBRATION_GAMES}), ранг ещё не присвоен | {kd_txt}"
+            )
+
+        elo_snapshot[s] = {
+            "elo_before":      elo_before,
+            "elo_mode_before": elo_mode_before,
+            "elo_after":       pdata["elo"],
+            "elo_mode_after":  pdata[f"elo_{mode}"],
+        }
 
     for uid in winners:
         _apply(uid, True, win_lines)
@@ -4282,14 +4429,6 @@ async def win_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Сохраняем снапшот для возможной отмены (/cancelwin) ─────────────────
     kd_snapshot = {str(uid): list(kd_by_uid.get(uid, (0, 0))) for uid in all_uids}
-    # Сохраняем фактически применённые дельты ELO для точного отката в /cancelwin
-    elo_snapshot: Dict[str, int] = {}
-    for uid in all_uids:
-        s_snap = str(uid)
-        pdata_snap = db["players"].get(s_snap, {})
-        platform_snap = pdata_snap.get("platform", "pc")
-        win_d_s, loss_d_s = elo_deltas_for(platform_snap)
-        elo_snapshot[s_snap] = win_d_s if uid in winners else loss_d_s
     db.setdefault("finished_matches", {})[m_id] = {
         "mode":         mode,
         "map":          m["maps"][0] if m.get("maps") else None,
@@ -4367,19 +4506,29 @@ async def cancelwin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not pdata:
             return
 
-        # Берём точную дельту из снапшота; если старый матч без снапшота — считаем по платформе
-        if s in elo_snapshot:
-            delta = elo_snapshot[s]
-        else:
-            platform      = pdata.get("platform", "pc")
-            win_d, loss_d = elo_deltas_for(platform)
-            delta = win_d if won else loss_d
+        snap = elo_snapshot.get(s)
 
-        # Откат ELO: победителям отнимаем, проигравшим добавляем
-        for field in ("elo", f"elo_{mode}"):
-            old_val = pdata.get(field, 1000)
-            new_val = max(ELO_MIN, old_val - delta) if won else (old_val + delta)
-            pdata[field] = new_val
+        if isinstance(snap, dict):
+            # Новый формат — просто восстанавливаем точные значения ЭЛО
+            # «до матча», сохранённые в /win. Корректно откатывает как
+            # обычные катки, так и матч, завершивший калибровку.
+            elo_after  = snap.get("elo_after",  pdata.get("elo", 0))
+            elo_before = snap.get("elo_before", pdata.get("elo", 0))
+            pdata["elo"]         = elo_before
+            pdata[f"elo_{mode}"] = snap.get("elo_mode_before", pdata.get(f"elo_{mode}", 0))
+            delta_display = elo_after - elo_before
+        else:
+            # Старый формат (матчи, сыгранные до внедрения калибровки «с нуля»)
+            if snap is not None:
+                delta = snap
+            else:
+                platform      = pdata.get("platform", "pc")
+                win_d, loss_d = elo_deltas_for(platform)
+                delta = win_d if won else loss_d
+            for field in ("elo", f"elo_{mode}"):
+                old_val = pdata.get(field, 0)
+                pdata[field] = max(ELO_MIN, old_val - delta) if won else (old_val + delta)
+            delta_display = -delta if won else delta
 
         # Откат побед/поражений
         if won:
@@ -4400,9 +4549,9 @@ async def cancelwin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pdata["total_kills"]  = max(0, pdata.get("total_kills", 0) - kills)
         pdata["total_deaths"] = max(0, pdata.get("total_deaths", 0) - deaths)
 
-        nick  = pdata.get("nickname", "?")
-        sign  = "-" if won else "+"
-        lines.append(f"  • {nick}: {sign}{delta} ELO → <b>{pdata['elo']}</b>")
+        nick = pdata.get("nickname", "?")
+        sign = "+" if delta_display >= 0 else "-"
+        lines.append(f"  • {nick}: {sign}{abs(delta_display)} ELO → <b>{pdata['elo']}</b>")
 
     for uid in winners:
         _revert(uid, True)
@@ -4677,10 +4826,10 @@ async def elo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for d in db["players"].values():
         if not d.get("external_id") or d.get("is_bot"): continue
         try:
-            for field, val in [("elo_5v5",1000),("wins_5v5",0),("losses_5v5",0),("avg_5v5",0.0),
-                               ("elo_2v2",1000),("wins_2v2",0),("losses_2v2",0),("avg_2v2",0.0),
+            for field, val in [("elo_5v5",0),("wins_5v5",0),("losses_5v5",0),("avg_5v5",0.0),
+                               ("elo_2v2",0),("wins_2v2",0),("losses_2v2",0),("avg_2v2",0.0),
                                ("total_kills",0),("total_deaths",0),
-                               ("wins",0),("losses",0),("avg",0.0),("elo",1000),
+                               ("wins",0),("losses",0),("avg",0.0),("elo",0),
                                ("platform","pc")]:
                 d.setdefault(field, val)
             p     = _make_player(d)
@@ -4806,9 +4955,9 @@ def _normalize_player(d: dict) -> dict:
         "user_id":      d.get("user_id", 0),
         "nickname":     d.get("nickname", "?"),
         "external_id":  d.get("external_id", ""),
-        "elo":          d.get("elo", 1000),
-        "elo_5v5":      d.get("elo_5v5", d.get("elo", 1000)),
-        "elo_2v2":      d.get("elo_2v2", d.get("elo", 1000)),
+        "elo":          d.get("elo", 0),
+        "elo_5v5":      d.get("elo_5v5", d.get("elo", 0)),
+        "elo_2v2":      d.get("elo_2v2", d.get("elo", 0)),
         "wins":         d.get("wins", 0),
         "losses":       d.get("losses", 0),
         "wins_5v5":     d.get("wins_5v5", 0),
@@ -5104,7 +5253,7 @@ async def api_player_by_tg(request):
         return web.json_response({"error": "not found"}, status=404, headers=CORS_HEADERS)
     p = _normalize_player(d)
     all_real = [pl for pl in db["players"].values() if pl.get("external_id") and not pl.get("is_bot")]
-    all_real.sort(key=lambda x: x.get("elo", 1000), reverse=True)
+    all_real.sort(key=lambda x: x.get("elo", 0), reverse=True)
     rank = 0
     for i, pl in enumerate(all_real, start=1):
         if str(pl.get("user_id")) == str(tg_id):
@@ -5138,14 +5287,20 @@ async def api_match_history(request):
             continue
         won = tg_id in winners
         kd  = m.get("kd_by_uid", {}).get(str(tg_id), [0, 0])
-        elo_delta = m.get("elo_snapshot", {}).get(str(tg_id))
-        if elo_delta is None:
+        raw_snap = m.get("elo_snapshot", {}).get(str(tg_id))
+        if isinstance(raw_snap, dict):
+            # Новый формат — знак и величина уже учитывают калибровку
+            # (0 во время калибровки, скачок на матче, где она завершилась).
+            elo_delta = raw_snap.get("elo_after", 0) - raw_snap.get("elo_before", 0)
+        elif raw_snap is not None:
+            elo_delta = raw_snap if won else -raw_snap
+        else:
             # Старые матчи (сыграны до того, как стал сохраняться elo_snapshot)
             # не хранят точную применённую дельту — считаем её по текущей
             # формуле начисления ELO, вместо того чтобы показывать +0 ELO.
             platform_fallback = players.get(str(tg_id), {}).get("platform", "pc")
             win_d_fb, loss_d_fb = elo_deltas_for(platform_fallback)
-            elo_delta = win_d_fb if won else loss_d_fb
+            elo_delta = win_d_fb if won else -loss_d_fb
         rows.append({
             "match_id":    m_id,
             "mode":        m.get("mode", "5v5"),
@@ -5153,7 +5308,7 @@ async def api_match_history(request):
             "won":         won,
             "kills":       kd[0] if len(kd) > 0 else 0,
             "deaths":      kd[1] if len(kd) > 1 else 0,
-            "elo_delta":   elo_delta if won else -elo_delta,
+            "elo_delta":   elo_delta,
             "finished_ts": m.get("finished_ts", 0),
             "teammates":   [_nick(u) for u in (winners if won else losers) if u != tg_id],
             "opponents":   [_nick(u) for u in (losers if won else winners)],
