@@ -4411,10 +4411,30 @@ def parse_scoreboard_ocr(image_bytes: bytes) -> Optional[dict]:
         except ValueError:
             blue_score = orange_score = None
 
-    return {"rows": rows, "blue_score": blue_score, "orange_score": orange_score}
+    # ── Запасной сигнал: баннер "ПОБЕДА"/"ПОРАЖЕНИЕ" ────────────────────
+    # На некоторых экранах (freeze-frame конца раунда/матча) числовой счёт
+    # закрыт этим баннером. Слово само по себе не говорит, ЧЬЯ это победа —
+    # это интерпретируется в _match_ocr_to_roster относительно того, кто
+    # прислал скриншот (он точно один из игроков этого матча).
+    result_word = None
+    for wd in words:
+        t = wd["text"].upper()
+        if "ПОБЕД" in t:
+            result_word = "victory"
+            break
+        if "ПОРАЖЕН" in t:
+            result_word = "defeat"
+            break
+
+    return {
+        "rows": rows,
+        "blue_score": blue_score,
+        "orange_score": orange_score,
+        "result_word": result_word,
+    }
 
 
-def _match_ocr_to_roster(m: dict, ocr: dict) -> tuple:
+def _match_ocr_to_roster(m: dict, ocr: dict, reporter_uid: Optional[int] = None) -> tuple:
     """
     Сопоставляет распознанные строки (по external_id) с реальными игроками
     матча m (ct/t списки uid). Возвращает (kd_by_uid, side_win, unmatched, missing).
@@ -4449,12 +4469,23 @@ def _match_ocr_to_roster(m: dict, ocr: dict) -> tuple:
     missing = [get_player(u).nickname for u in all_uids if u not in matched_uids]
 
     # ── Определяем победившую сторону ────────────────────────────────
-    side_win = None
+    winning_color = None
     if ocr.get("blue_score") is not None and ocr.get("orange_score") is not None:
         winning_color = "blue" if ocr["blue_score"] > ocr["orange_score"] else (
             "orange" if ocr["orange_score"] > ocr["blue_score"] else None
         )
-        if winning_color:
+
+    if winning_color is None and ocr.get("result_word") and reporter_uid is not None:
+        reporter_color = row_team_of_uid.get(reporter_uid)
+        if reporter_color in ("blue", "orange"):
+            other_color = "orange" if reporter_color == "blue" else "blue"
+            if ocr["result_word"] == "victory":
+                winning_color = reporter_color
+            elif ocr["result_word"] == "defeat":
+                winning_color = other_color
+
+    side_win = None
+    if winning_color:
             # Какая физическая сторона (ct/t в базе) соответствует этому цвету?
             # Смотрим, к какой db-стороне принадлежит большинство игроков с этим цветом.
             ct_set = set(m.get("ct", []))
@@ -4509,90 +4540,109 @@ async def scoreboard_photo_handler(update: Update, context: ContextTypes.DEFAULT
     if not ADMIN_GROUP_ID:
         return
 
-    # ── Пробуем распознать результат сами (OCR) ──────────────────────────
-    ocr_result = None
-    kd_by_uid: Dict[int, tuple] = {}
-    side_win = None
-    unmatched: List[str] = []
-    missing: List[str] = []
     try:
-        photo_file = await msg.photo[-1].get_file()
-        photo_bytes = bytes(await photo_file.download_as_bytearray())
-        ocr_result = parse_scoreboard_ocr(photo_bytes)
-        if ocr_result:
-            kd_by_uid, side_win, unmatched, missing = _match_ocr_to_roster(m, ocr_result)
-    except Exception as e:
-        print(f"[scoreboard] ocr error: {e!r}")
+        # ── Пробуем распознать результат сами (OCR) ──────────────────────
         ocr_result = None
+        kd_by_uid: Dict[int, tuple] = {}
+        side_win = None
+        unmatched: List[str] = []
+        missing: List[str] = []
+        try:
+            photo_file = await msg.photo[-1].get_file()
+            photo_bytes = bytes(await photo_file.download_as_bytearray())
+            ocr_result = parse_scoreboard_ocr(photo_bytes)
+            if ocr_result:
+                kd_by_uid, side_win, unmatched, missing = _match_ocr_to_roster(m, ocr_result, reporter_uid=uid)
+        except Exception as e:
+            print(f"[scoreboard] ocr error: {e!r}")
+            ocr_result = None
 
-    try:
-        await context.bot.forward_message(
-            chat_id=ADMIN_GROUP_ID,
-            from_chat_id=msg.chat_id,
-            message_id=msg.message_id,
-        )
-    except Exception as e:
-        print(f"[scoreboard] admin forward error: {e}")
+        try:
+            await context.bot.forward_message(
+                chat_id=ADMIN_GROUP_ID,
+                from_chat_id=msg.chat_id,
+                message_id=msg.message_id,
+            )
+        except Exception as e:
+            print(f"[scoreboard] admin forward error: {e!r}")
 
-    ocr_ok = bool(ocr_result) and side_win is not None and not unmatched and not missing and len(kd_by_uid) >= 2
+        ocr_ok = bool(ocr_result) and side_win is not None and not unmatched and not missing and len(kd_by_uid) >= 2
 
-    if not ocr_ok:
-        reasons = []
-        if not _ocr_available():
-            reasons.append("на сервере не настроен OCR (tesseract)")
-        elif not ocr_result:
-            reasons.append("не нашёл таблицу на скрине (плохой ракурс/качество)")
-        else:
-            if side_win is None:
-                reasons.append("не разобрал счёт команд")
-            if unmatched:
-                reasons.append("есть нераспознанные/чужие ID: " + ", ".join(unmatched))
-            if missing:
-                reasons.append("не нашёл строку для: " + ", ".join(missing))
+        if not ocr_ok:
+            reasons = []
+            if not _ocr_available():
+                reasons.append("на сервере не настроен OCR (tesseract не найден — проверь Aptfile/requirements.txt на Railway)")
+            elif not ocr_result:
+                reasons.append("не нашёл таблицу на скрине (плохой ракурс/качество/не тот интерфейс)")
+            else:
+                if side_win is None:
+                    reasons.append("не разобрал счёт команд")
+                if unmatched:
+                    reasons.append("есть нераспознанные/чужие ID: " + ", ".join(unmatched))
+                if missing:
+                    reasons.append("не нашёл строку для: " + ", ".join(missing))
+            await context.bot.send_message(
+                chat_id=ADMIN_GROUP_ID,
+                text=(
+                    f"📸 Скрин результатов матча #{m_id}\n"
+                    f"От: <a href=\"tg://user?id={uid}\">{p.nickname}</a>\n\n"
+                    f"⚠️ Бот не смог уверенно распознать результат автоматически "
+                    f"({'; '.join(reasons) if reasons else 'неизвестная причина'}).\n"
+                    f"Проверьте вручную и введите <code>/win {m_id} ct|t ...</code>."
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        # ── Уверенно распознали — предлагаем админу подтвердить одной кнопкой ──
+        db["pending_ocr"][m_id] = {
+            "side":       side_win,
+            "kd_by_uid":  {str(k): list(v) for k, v in kd_by_uid.items()},
+            "reported_by": uid,
+        }
+        save_db(db)
+
+        win_label = "🔵 CT" if side_win == "ct" else "🔴 T"
+        lines = []
+        for u, (k, d) in kd_by_uid.items():
+            pl = get_player(u)
+            side_tag = "🏆" if (u in m.get(side_win, [])) else "❌"
+            lines.append(f"  {side_tag} {pl.nickname}: {k}/{d}")
+
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Подтвердить и применить", callback_data=f"ocrwin_confirm:{m_id}"),
+            InlineKeyboardButton("✏️ Ввести вручную",         callback_data=f"ocrwin_manual:{m_id}"),
+        ]])
+
         await context.bot.send_message(
             chat_id=ADMIN_GROUP_ID,
             text=(
-                f"📸 Скрин результатов матча #{m_id}\n"
-                f"От: <a href=\"tg://user?id={uid}\">{p.nickname}</a>\n\n"
-                f"⚠️ Бот не смог уверенно распознать результат автоматически "
-                f"({'; '.join(reasons) if reasons else 'неизвестная причина'}).\n"
-                f"Проверьте вручную и введите <code>/win {m_id} ct|t ...</code>."
+                f"🤖 <b>Матч #{m_id}</b> — бот распознал результат по скрину:\n\n"
+                f"Победила сторона: {win_label}\n" + "\n".join(lines) +
+                f"\n\nОт: <a href=\"tg://user?id={uid}\">{p.nickname}</a>\n\n"
+                f"Проверьте и подтвердите, либо введите вручную через /win."
             ),
             parse_mode=ParseMode.HTML,
+            reply_markup=kb,
         )
-        return
-
-    # ── Уверенно распознали — предлагаем админу подтвердить одной кнопкой ──
-    db["pending_ocr"][m_id] = {
-        "side":       side_win,
-        "kd_by_uid":  {str(k): list(v) for k, v in kd_by_uid.items()},
-        "reported_by": uid,
-    }
-    save_db(db)
-
-    win_label = "🔵 CT" if side_win == "ct" else "🔴 T"
-    lines = []
-    for u, (k, d) in kd_by_uid.items():
-        pl = get_player(u)
-        side_tag = "🏆" if (u in m.get(side_win, [])) else "❌"
-        lines.append(f"  {side_tag} {pl.nickname}: {k}/{d}")
-
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Подтвердить и применить", callback_data=f"ocrwin_confirm:{m_id}"),
-        InlineKeyboardButton("✏️ Ввести вручную",         callback_data=f"ocrwin_manual:{m_id}"),
-    ]])
-
-    await context.bot.send_message(
-        chat_id=ADMIN_GROUP_ID,
-        text=(
-            f"🤖 <b>Матч #{m_id}</b> — бот распознал результат по скрину:\n\n"
-            f"Победила сторона: {win_label}\n" + "\n".join(lines) +
-            f"\n\nОт: <a href=\"tg://user?id={uid}\">{p.nickname}</a>\n\n"
-            f"Проверьте и подтвердите, либо введите вручную через /win."
-        ),
-        parse_mode=ParseMode.HTML,
-        reply_markup=kb,
-    )
+    except Exception as e:
+        # Подстраховка: если где-то в блоке выше что-то пошло не так и
+        # не было поймано локально — не даём ошибке пройти полностью молча.
+        # Печатаем traceback в лог Railway И пытаемся всё равно уведомить
+        # админ-группу, чтобы результат не потерялся без следа.
+        import traceback
+        traceback.print_exc()
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_GROUP_ID,
+                text=(
+                    f"⚠️ Ошибка при обработке скрина матча #{m_id}: <code>{e!r}</code>\n"
+                    f"Проверьте вручную и введите <code>/win {m_id} ct|t ...</code>."
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e2:
+            print(f"[scoreboard] даже фолбэк-уведомление не отправилось: {e2!r}")
 
 
 # ════════════════════════════════════════════════
