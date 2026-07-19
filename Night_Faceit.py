@@ -238,6 +238,7 @@ def load_db() -> Dict[str, Any]:
         "queue_5v5": [], "queue_2v2": [], "lobby_5v5": {}, "lobby_2v2": {}, "muted": {}, "banned": {}, "bot_counter": 0,
         "tickets": {}, "ticket_counter": 0, "user_open_ticket": {},
         "pending_ocr": {},      # m_id -> распознанный ботом результат матча, ждёт подтверждения админа
+        "unresolved_results": {},  # m_id -> скрин прислали, но OCR не распознал — нужна ручная проверка
         "dm_result_wait": {},   # str(uid) -> m_id: игрок нажал «Отправить результат» в ЛС и должен прислать скрин
     }
     if not os.path.exists(DATA_FILE):
@@ -2985,7 +2986,7 @@ async def resetdb_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "queue_5v5": [], "queue_2v2": [], "lobby_5v5": {}, "lobby_2v2": {},
         "muted": {}, "banned": {}, "bot_counter": 0, "warns": {},
         "tickets": {}, "ticket_counter": 0, "user_open_ticket": {},
-        "pending_ocr": {}, "dm_result_wait": {},
+        "pending_ocr": {}, "dm_result_wait": {}, "unresolved_results": {},
     }
     _db_cache = empty
     with open(DATA_FILE, "w", encoding="utf-8") as f:
@@ -3561,8 +3562,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await q.answer()
         db = load_db()
-        pending = db.get("pending_ocr", {})
-        if not pending:
+        pending    = db.get("pending_ocr", {})
+        unresolved = db.get("unresolved_results", {})
+        if not pending and not unresolved:
             try:
                 await context.bot.send_message(chat_id=uid, text="✅ Нет матчей, ожидающих подтверждения результата.")
             except Exception:
@@ -3576,6 +3578,25 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text, kb = _build_ocr_confirm_card(m_id, m, p_data)
             try:
                 await context.bot.send_message(chat_id=uid, text=text, parse_mode=ParseMode.HTML, reply_markup=kb)
+                sent_any = True
+            except Exception:
+                pass
+        for m_id, u_data in unresolved.items():
+            if m_id in pending:
+                continue  # уже показали выше как распознанный
+            m = db.get("active_matches", {}).get(m_id)
+            if not m:
+                continue
+            reporter = get_player(u_data.get("reported_by")) if u_data.get("reported_by") else None
+            reasons = u_data.get("reasons") or []
+            text = (
+                f"📸 <b>Матч #{m_id}</b> — прислан скрин, но бот <u>не смог распознать</u> результат.\n"
+                + (f"Причина: {'; '.join(reasons)}\n" if reasons else "") +
+                (f"\nОт: {reporter.tg_link()}" if reporter else "") +
+                f"\n\nВведите результат вручную:\n<code>/win {m_id} ct|t ...</code>"
+            )
+            try:
+                await context.bot.send_message(chat_id=uid, text=text, parse_mode=ParseMode.HTML)
                 sent_any = True
             except Exception:
                 pass
@@ -4352,6 +4373,7 @@ def _finalize_match(db: Dict[str, Any], m_id: str, m: dict, side: str, kd_by_uid
         "finished_ts":  datetime.now().timestamp(),
     }
     db["active_matches"].pop(m_id, None)
+    db.get("unresolved_results", {}).pop(m_id, None)
 
     return win_lines, loss_lines, calib_notifications, mode, winners, losers
 
@@ -4688,6 +4710,17 @@ async def _process_result_screenshot(m_id: str, m: dict, uid: int, msg, context:
                     reasons.append("есть нераспознанные/чужие ID: " + ", ".join(unmatched))
                 if missing:
                     reasons.append("не нашёл строку для: " + ", ".join(missing))
+
+            # Помечаем матч как «есть скрин, но не распознан» — это увидит
+            # любой админ/мод через кнопку «🧾 Результаты матчей» в ЛС,
+            # даже если он не сидит в админ-конфе.
+            db.setdefault("unresolved_results", {})[m_id] = {
+                "reported_by": uid,
+                "reasons":     reasons,
+                "ts":          time.time(),
+            }
+            save_db(db)
+
             if ADMIN_GROUP_ID:
                 await context.bot.send_message(
                     chat_id=ADMIN_GROUP_ID,
@@ -4701,6 +4734,9 @@ async def _process_result_screenshot(m_id: str, m: dict, uid: int, msg, context:
                     parse_mode=ParseMode.HTML,
                 )
             return
+
+        # Успешно распознали — если раньше матч висел как «нераспознанный», убираем отметку
+        db.get("unresolved_results", {}).pop(m_id, None)
 
         # ── Уверенно распознали — кладём в очередь на подтверждение админом ──
         db.setdefault("pending_ocr", {})[m_id] = {
