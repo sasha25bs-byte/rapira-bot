@@ -1923,6 +1923,48 @@ def _make_gradient(w: int, h: int, c1: tuple, c2: tuple, steps: int = 48) -> Ima
     return small.resize((w, h), Image.BILINEAR)
 
 
+# ── ФОТО КАРТЫ (для карточки /stats) ────────────────────────────────
+# Файл кладём рядом со скриптом, в папку images/ (например images/dust2.jpg).
+MAP_IMAGES = {
+    "Dust 2": "dust2.jpg",
+}
+
+_map_image_cache: Dict[str, Optional[Image.Image]] = {}
+
+
+def _load_map_image(map_name: str) -> Optional[Image.Image]:
+    """Загружает и кэширует фото карты. Ищет и в images/, и рядом со скриптом,
+    чтобы не завязываться на точную структуру папок в репозитории."""
+    if map_name in _map_image_cache:
+        return _map_image_cache[map_name]
+    fname = MAP_IMAGES.get(map_name)
+    img = None
+    if fname:
+        base = _os.path.dirname(_os.path.abspath(__file__))
+        for candidate in (_os.path.join(base, "images", fname), _os.path.join(base, fname)):
+            if _os.path.exists(candidate):
+                try:
+                    img = Image.open(candidate).convert("RGB")
+                except Exception as e:
+                    print(f"⚠️ Не удалось открыть фото карты {candidate}: {e!r}")
+                break
+    _map_image_cache[map_name] = img
+    return img
+
+
+def _cover_crop(img: Image.Image, tw: int, th: int) -> Image.Image:
+    """Аналог CSS background-size:cover — масштабирует и обрезает по центру,
+    чтобы заполнить прямоугольник tw×th без искажения пропорций."""
+    tw, th = max(1, int(tw)), max(1, int(th))
+    sw, sh = img.size
+    scale = max(tw / sw, th / sh)
+    nw, nh = max(1, math.ceil(sw * scale)), max(1, math.ceil(sh * scale))
+    resized = img.resize((nw, nh), Image.LANCZOS)
+    left = (nw - tw) // 2
+    top = (nh - th) // 2
+    return resized.crop((left, top, left + tw, top + th))
+
+
 def _card_section_title(d: ImageDraw.ImageDraw, x: int, y: int, text: str, font,
                          accent=(150, 110, 255)):
     """Заголовок секции с цветным акцентным маркером слева (замена emoji-иконкам)."""
@@ -2153,19 +2195,40 @@ def render_stats_card(target: int, out_path: str, group_name: str = "NightFaceit
     yl += 44
 
     row3_h = 210
+    tile_w = int(row_w)
     map_tile_box = [MARGIN, yl, MARGIN + row_w, yl + row3_h]
-    map_grad = _make_gradient(int(row_w), row3_h, (54, 38, 78), (18, 14, 30))
-    map_mask = Image.new("L", (int(row_w), row3_h), 0)
-    ImageDraw.Draw(map_mask).rounded_rectangle([0, 0, int(row_w) - 1, row3_h - 1], radius=16, fill=255)
-    img.paste(map_grad, (int(MARGIN), int(yl)), map_mask)
+    tile_mask = Image.new("L", (tile_w, row3_h), 0)
+    ImageDraw.Draw(tile_mask).rounded_rectangle([0, 0, tile_w - 1, row3_h - 1], radius=16, fill=255)
+
+    map_photo = _load_map_image(map_name)
+    tcx = MARGIN + row_w / 2
+    if map_photo:
+        tile_img = _cover_crop(map_photo, tile_w, row3_h)
+        if not p.is_calibrated:
+            # На карточке калибровки фото приглушено (ч/б + затемнение),
+            # как на референсе — статистика ещё недоступна.
+            gray = tile_img.convert("L").convert("RGB")
+            tile_img = Image.blend(gray, Image.new("RGB", gray.size, (0, 0, 0)), 0.35)
+        img.paste(tile_img, (int(MARGIN), int(yl)), tile_mask)
+
+        # Затемнённая плашка снизу под подписью карты — для контраста поверх фото,
+        # с сохранением скруглённых нижних углов плитки.
+        cap_h = 46
+        cap_mask = tile_mask.crop((0, row3_h - cap_h, tile_w, row3_h))
+        region = img.crop((int(MARGIN), int(yl + row3_h - cap_h), int(MARGIN + tile_w), int(yl + row3_h)))
+        darkened = Image.blend(region, Image.new("RGB", region.size, (10, 9, 15)), 0.72)
+        img.paste(darkened, (int(MARGIN), int(yl + row3_h - cap_h)), cap_mask)
+    else:
+        # Фолбэк, если файл фото карты не найден рядом со скриптом.
+        map_grad = _make_gradient(tile_w, row3_h, (54, 38, 78), (18, 14, 30))
+        img.paste(map_grad, (int(MARGIN), int(yl)), tile_mask)
+        initials = "".join(w[0] for w in map_name.split()[:2]).upper()
+        tb = d.textbbox((0, 0), initials, font=f_title)
+        d.text((tcx - (tb[2] - tb[0]) / 2 - tb[0], yl + row3_h / 2 - (tb[3] - tb[1]) / 2 - tb[1] - 6),
+               initials, font=f_title, fill=(220, 200, 255))
+        d.rectangle([MARGIN, yl + row3_h - 46, MARGIN + row_w, yl + row3_h], fill=(12, 10, 20))
+
     d.rounded_rectangle(map_tile_box, radius=16, outline=_CARD_ROW_BORDER, width=1)
-    initials = "".join(w[0] for w in map_name.split()[:2]).upper()
-    tb = d.textbbox((0, 0), initials, font=f_title)
-    tcx, tcy = MARGIN + row_w / 2, yl + row3_h / 2
-    d.text((tcx - (tb[2] - tb[0]) / 2 - tb[0], tcy - (tb[3] - tb[1]) / 2 - tb[1] - 6),
-           initials, font=f_title, fill=(220, 200, 255))
-    # тёмная подложка снизу под название карты — для контраста поверх градиента
-    d.rectangle([MARGIN, yl + row3_h - 46, MARGIN + row_w, yl + row3_h], fill=(12, 10, 20))
     mn_tb = d.textbbox((0, 0), map_name.upper(), font=f_box_lb)
     d.text((tcx - (mn_tb[2] - mn_tb[0]) / 2, yl + row3_h - 34), map_name.upper(), font=f_box_lb, fill=_CARD_WHITE)
 
