@@ -13,6 +13,11 @@ import math
 import aiohttp
 from aiohttp import web
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
+
+try:
+    import pytesseract  # распознавание скорборда со скриншота (см. parse_scoreboard_ocr)
+except ImportError:
+    pytesseract = None
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, MenuButtonWebApp, WebAppInfo,
     ChatPermissions, BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats, BotCommandScopeDefault,
@@ -232,6 +237,7 @@ def load_db() -> Dict[str, Any]:
         "players": {}, "match_counter": 0, "active_matches": {},
         "queue_5v5": [], "queue_2v2": [], "lobby_5v5": {}, "lobby_2v2": {}, "muted": {}, "banned": {}, "bot_counter": 0,
         "tickets": {}, "ticket_counter": 0, "user_open_ticket": {},
+        "pending_ocr": {},   # m_id -> распознанный ботом результат матча, ждёт подтверждения админа
     }
     if not os.path.exists(DATA_FILE):
         _db_cache = default
@@ -3420,6 +3426,60 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer("🔇 Вы в муте — любые действия запрещены!", show_alert=True)
             return
 
+    # ── ПОДТВЕРЖДЕНИЕ РАСПОЗНАННОГО РЕЗУЛЬТАТА МАТЧА (OCR) ────────────────────
+    if cb.startswith("ocrwin_confirm:") or cb.startswith("ocrwin_manual:"):
+        if not is_moderator(uid):
+            await q.answer("❌ Недостаточно прав.", show_alert=True)
+            return
+        action, m_id = cb.split(":", 1)
+        db = load_db()
+
+        if action == "ocrwin_manual":
+            db.get("pending_ocr", {}).pop(m_id, None)
+            save_db(db)
+            await q.answer()
+            try:
+                await q.edit_message_text(
+                    (q.message.text or "") + f"\n\n✏️ Отклонено — введите результат командой /win {m_id} ...",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+            return
+
+        # ocrwin_confirm
+        pending = db.get("pending_ocr", {}).get(m_id)
+        m = db.get("active_matches", {}).get(m_id)
+        if not pending or not m:
+            await q.answer("❌ Матч уже обработан или недоступен.", show_alert=True)
+            return
+
+        await q.answer()
+        side = pending["side"]
+        kd_by_uid = {int(k): tuple(v) for k, v in pending["kd_by_uid"].items()}
+
+        win_lines, loss_lines, calib_notifications, mode, winners, losers = _finalize_match(
+            db, m_id, m, side, kd_by_uid
+        )
+        db.get("pending_ocr", {}).pop(m_id, None)
+        save_db(db)
+        await _send_calibration_dms(context.bot, calib_notifications)
+
+        win_side_label  = "🔵 CT" if side == "ct" else "🔴 T"
+        lose_side_label = "🔴 T"  if side == "ct" else "🔵 CT"
+        text = (
+            f"🏆 <b>Матч #{m_id} [{mode.upper()}] завершён!</b> (подтверждено {q.from_user.first_name})\n\n"
+            f"✅ Победила сторона: {win_side_label}\n"
+            + ("\n".join(win_lines) if win_lines else "  (нет реальных игроков)") + "\n\n"
+            f"❌ Проиграла сторона: {lose_side_label}\n"
+            + ("\n".join(loss_lines) if loss_lines else "  (нет реальных игроков)")
+        )
+        try:
+            await q.edit_message_text(text, parse_mode=ParseMode.HTML)
+        except Exception:
+            await context.bot.send_message(chat_id=q.message.chat_id, text=text, parse_mode=ParseMode.HTML)
+        return
+
     # ── ГЛАВНОЕ МЕНЮ (ЛС) ────────────────────────────────────────────────────
     if cb == "cmd_menu":
         await q.answer()
@@ -4037,6 +4097,375 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #         ОБРАБОТКА СКРИНОВ РЕЗУЛЬТАТОВ (РУЧНАЯ)
 # ════════════════════════════════════════════════
 
+def _apply_win_to_player(
+    db: Dict[str, Any],
+    target_uid: int,
+    won: bool,
+    mode: str,
+    kd_by_uid: Dict[int, tuple],
+    lines: List[str],
+    elo_snapshot: Dict[str, dict],
+    calib_notifications: List[tuple],
+) -> None:
+    """
+    Начисляет/списывает ELO одному игроку, обновляет W/L, винрейт, накопительный
+    KD и (если только что закончилась калибровка) выдаёт стартовый ранг.
+    Вынесено в отдельную функцию, чтобы одинаково применялось что из /win
+    (ручной ввод), что из авто-подтверждения результата, распознанного ботом
+    со скриншота (см. parse_scoreboard_ocr + callback ocrwin_confirm).
+    """
+    if _is_bot_uid(target_uid):
+        return
+    s = str(target_uid)
+    pdata = db["players"].get(s)
+    if not pdata:
+        return
+
+    platform      = pdata.get("platform", "pc")
+    win_d, loss_d = elo_deltas_for(platform)
+
+    elo_before      = pdata.get("elo", 0)
+    elo_mode_before = pdata.get(f"elo_{mode}", 0)
+    games_before     = pdata.get("wins", 0) + pdata.get("losses", 0)
+    was_calibrated   = games_before >= CALIBRATION_GAMES
+
+    if was_calibrated:
+        delta = win_d if won else -loss_d
+        for field, before in (("elo", elo_before), (f"elo_{mode}", elo_mode_before)):
+            pdata[field] = max(ELO_MIN, before + delta)
+
+    if won:
+        pdata["wins"]            = pdata.get("wins", 0) + 1
+        pdata[f"wins_{mode}"]    = pdata.get(f"wins_{mode}", 0) + 1
+    else:
+        pdata["losses"]          = pdata.get("losses", 0) + 1
+        pdata[f"losses_{mode}"]  = pdata.get(f"losses_{mode}", 0) + 1
+
+    w, l   = pdata.get("wins", 0), pdata.get("losses", 0)
+    wm, lm = pdata.get(f"wins_{mode}", 0), pdata.get(f"losses_{mode}", 0)
+    pdata["avg"]          = round(w / (w + l) * 100, 1) if (w + l) else 0.0
+    pdata[f"avg_{mode}"]  = round(wm / (wm + lm) * 100, 1) if (wm + lm) else 0.0
+
+    games_after    = w + l
+    calib_done_now = (not was_calibrated) and games_after >= CALIBRATION_GAMES
+    start_elo      = None
+    if calib_done_now:
+        win_rate  = (w / games_after) if games_after else 0.0
+        start_elo = int(round(CALIBRATION_BASE_ELO + (win_rate - 0.5) * CALIBRATION_SWING))
+        start_elo = max(ELO_MIN, min(2000, start_elo))
+        pdata["elo"]         = start_elo
+        pdata[f"elo_{mode}"] = start_elo
+        calib_notifications.append((target_uid, start_elo, _lvl_number(start_elo)))
+
+    kills, deaths = kd_by_uid.get(target_uid, (0, 0))
+    pdata["total_kills"]  = pdata.get("total_kills", 0) + kills
+    pdata["total_deaths"] = pdata.get("total_deaths", 0) + deaths
+    total_kd = round(pdata["total_kills"] / pdata["total_deaths"], 2) if pdata["total_deaths"] else float(pdata["total_kills"])
+
+    nick   = pdata.get("nickname", "?")
+    kd_txt = (
+        f"{kills}/{deaths} (KD матча {round(kills/deaths, 2) if deaths else kills}) | "
+        f"общий KD: <b>{total_kd}</b>"
+    )
+
+    if calib_done_now:
+        lines.append(
+            f"  • {nick}: 🔄→✅ <b>калибровка завершена!</b> Стартовый ранг: <b>{start_elo}</b> ELO | {kd_txt}"
+        )
+    elif was_calibrated:
+        sign    = "+" if won else "-"
+        applied = win_d if won else loss_d
+        lines.append(
+            f"  • {nick}: {sign}{applied} ELO → <b>{pdata['elo']}</b> | {kd_txt}"
+        )
+    else:
+        lines.append(
+            f"  • {nick}: 🔄 калибровочный матч ({games_after}/{CALIBRATION_GAMES}), ранг ещё не присвоен | {kd_txt}"
+        )
+
+    elo_snapshot[s] = {
+        "elo_before":      elo_before,
+        "elo_mode_before": elo_mode_before,
+        "elo_after":       pdata["elo"],
+        "elo_mode_after":  pdata[f"elo_{mode}"],
+    }
+
+
+async def _send_calibration_dms(bot, calib_notifications: List[tuple]) -> None:
+    """ЛС-уведомление игрокам, которые только что прошли калибровку."""
+    for cal_uid, cal_elo, cal_lvl in calib_notifications:
+        try:
+            await bot.send_message(
+                chat_id=cal_uid,
+                text=(
+                    f"✅ <b>Вы прошли калибровку!</b>\n\n"
+                    f"Сыграно {CALIBRATION_GAMES} калибровочных матчей — "
+                    f"бот определил ваш стартовый уровень.\n\n"
+                    f"🏆 Уровень: <b>{cal_lvl}</b>\n"
+                    f"📊 ELO: <b>{cal_elo}</b>\n\n"
+                    f"Дальше ЭЛО меняется за каждую победу/поражение — удачи!"
+                ),
+                parse_mode=ParseMode.HTML
+            )
+        except Exception as e:
+            print(f"⚠️ Не удалось отправить ЛС о калибровке uid={cal_uid}: {e!r}")
+
+
+def _finalize_match(db: Dict[str, Any], m_id: str, m: dict, side: str, kd_by_uid: Dict[int, tuple]):
+    """
+    Общее ядро завершения матча: начисляет результат обеим сторонам,
+    сохраняет снапшот в finished_matches (для /cancelwin), убирает матч
+    из active_matches. НЕ вызывает save_db и не шлёт сообщений — это
+    делает вызывающий код (win_cmd / ocrwin_confirm), т.к. им нужно
+    показать разный текст пользователю.
+    Возвращает (win_lines, loss_lines, calib_notifications, mode, winners, losers).
+    """
+    winners = m.get("ct", []) if side == "ct" else m.get("t", [])
+    losers  = m.get("t", [])  if side == "ct" else m.get("ct", [])
+    mode    = m.get("mode", "5v5")
+    all_uids = [u for u in (winners + losers) if not _is_bot_uid(u)]
+
+    win_lines: List[str] = []
+    loss_lines: List[str] = []
+    elo_snapshot: Dict[str, dict] = {}
+    calib_notifications: List[tuple] = []
+
+    for uid in winners:
+        _apply_win_to_player(db, uid, True, mode, kd_by_uid, win_lines, elo_snapshot, calib_notifications)
+    for uid in losers:
+        _apply_win_to_player(db, uid, False, mode, kd_by_uid, loss_lines, elo_snapshot, calib_notifications)
+
+    kd_snapshot = {str(uid): list(kd_by_uid.get(uid, (0, 0))) for uid in all_uids}
+    db.setdefault("finished_matches", {})[m_id] = {
+        "mode":         mode,
+        "map":          m["maps"][0] if m.get("maps") else None,
+        "winners":      winners,
+        "losers":       losers,
+        "kd_by_uid":    kd_snapshot,
+        "elo_snapshot": elo_snapshot,
+        "finished_ts":  datetime.now().timestamp(),
+    }
+    db["active_matches"].pop(m_id, None)
+
+    return win_lines, loss_lines, calib_notifications, mode, winners, losers
+
+
+# ════════════════════════════════════════════════
+#     РАСПОЗНАВАНИЕ СКОРБОРДА (OCR, Tesseract)
+# ════════════════════════════════════════════════
+#
+# Бот пытается сам прочитать финальный скорборд со скриншота: ники, игровые
+# ID, киллы/смерти и счёт команд — чтобы не заставлять админа набирать всё
+# руками. Это ЭВРИСТИКА поверх OCR, а не идеальное распознавание: разные
+# разрешения экрана, HUD-элементы поверх таблицы (прицел, руки с ножом и т.п.),
+# засветы и обрезанные скрины будут иногда путать бота.
+#
+# Поэтому результат распознавания НИКОГДА не применяется сам по себе — бот
+# присылает админ-группе карточку "вот что я увидел" с кнопками
+# "✅ Подтвердить" / "✏️ Ввести вручную". Только нажатие кнопки применяет
+# результат. Если бот вообще не смог уверенно распознать таблицу — он прямо
+# так и скажет, и попросит ввести /win руками, как раньше.
+
+def _ocr_available() -> bool:
+    return pytesseract is not None
+
+
+def parse_scoreboard_ocr(image_bytes: bytes) -> Optional[dict]:
+    """
+    Пытается разобрать скриншот финального скорборда.
+
+    Алгоритм:
+      1) Прогоняем всё изображение через Tesseract (рус+eng), получаем слова
+         с координатами.
+      2) Находим заголовки колонок "УБИЙСТВ" / "СМЕРТЕЙ" — это даёт X-координаты
+         колонок независимо от разрешения скрина.
+      3) Группируем найденные числа в строки по Y-координате (одна строка
+         игрока = одна визуальная линия таблицы).
+      4) В каждой строке: число под колонкой "УБИЙСТВ" → киллы, под "СМЕРТЕЙ" →
+         смерти, число левее (в стороне ника) → игровой ID, текст левее ID → ник.
+      5) Цвет пикселя рядом с ником (синий/оранжевый) определяет команду —
+         так же различаются строки на самом скрине.
+      6) Два числа над таблицей, по центру экрана — счёт команд; сторона
+         с большим числом — победитель.
+
+    Возвращает None, если не удалось найти таблицу вообще (нет заголовков)
+    или строк меньше двух — тогда вызывающий код должен откатиться на ручной
+    ввод через /win.
+    """
+    if not _ocr_available():
+        return None
+    try:
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    except Exception:
+        return None
+
+    w, h = img.size
+    try:
+        data = pytesseract.image_to_data(img, lang="rus+eng", output_type=pytesseract.Output.DICT)
+    except Exception as e:
+        print(f"[ocr] tesseract error: {e!r}")
+        return None
+
+    words = []
+    for i in range(len(data.get("text", []))):
+        txt = (data["text"][i] or "").strip()
+        if not txt:
+            continue
+        try:
+            conf = int(float(data["conf"][i]))
+        except (ValueError, TypeError):
+            conf = -1
+        if conf < 25:
+            continue
+        words.append({
+            "text": txt,
+            "x": data["left"][i], "y": data["top"][i],
+            "w": data["width"][i], "h": data["height"][i],
+        })
+
+    kills_x = deaths_x = header_y = None
+    for wd in words:
+        t = wd["text"].upper()
+        if "УБИЙСТ" in t and kills_x is None:
+            kills_x = wd["x"] + wd["w"] // 2
+            header_y = wd["y"]
+        elif "СМЕРТ" in t and deaths_x is None:
+            deaths_x = wd["x"] + wd["w"] // 2
+            header_y = wd["y"] if header_y is None else min(header_y, wd["y"])
+
+    if kills_x is None or deaths_x is None:
+        return None  # не нашли шапку таблицы — не похоже на наш скорборд
+
+    col_tol = max(45, w // 18)
+    row_tol = max(16, h // 55)
+
+    number_words = [wd for wd in words if wd["text"].isdigit() and wd["y"] > header_y]
+
+    rows_y: List[int] = []
+    for wd in sorted(number_words, key=lambda x: x["y"]):
+        if not any(abs(wd["y"] - ry) < row_tol for ry in rows_y):
+            rows_y.append(wd["y"])
+
+    rows = []
+    for ry in rows_y:
+        row_nums = [wd for wd in number_words if abs(wd["y"] - ry) < row_tol]
+
+        def _closest(target_x):
+            cands = [wd for wd in row_nums if abs(wd["x"] - target_x) < col_tol]
+            return min(cands, key=lambda wd: abs(wd["x"] - target_x)) if cands else None
+
+        kills_cell  = _closest(kills_x)
+        deaths_cell = _closest(deaths_x)
+        if not kills_cell or not deaths_cell or kills_cell is deaths_cell:
+            continue
+
+        id_candidates = [
+            wd for wd in row_nums
+            if wd is not kills_cell and wd is not deaths_cell and wd["x"] < kills_x - col_tol
+        ]
+        if not id_candidates:
+            continue
+        id_cell = max(id_candidates, key=lambda wd: wd["x"])
+
+        nick_words = [
+            wd for wd in words
+            if not wd["text"].isdigit()
+            and abs(wd["y"] - ry) < row_tol
+            and wd["x"] < id_cell["x"] - 5
+        ]
+        nick_words.sort(key=lambda wd: wd["x"])
+        nickname = " ".join(wd["text"] for wd in nick_words) if nick_words else None
+        if not nickname:
+            continue
+
+        sample_x = max(0, min(w - 1, nick_words[0]["x"] + 5))
+        sample_y = max(0, min(h - 1, ry + max(4, nick_words[0]["h"] // 2)))
+        try:
+            r, g, b = img.getpixel((sample_x, sample_y))[:3]
+        except Exception:
+            r, g, b = (0, 0, 0)
+        team = "blue" if b > r + 12 else ("orange" if r > b + 12 else "unknown")
+
+        rows.append({
+            "external_id": id_cell["text"],
+            "nickname":    nickname,
+            "kills":       int(kills_cell["text"]),
+            "deaths":      int(deaths_cell["text"]),
+            "team":        team,
+        })
+
+    if len(rows) < 2:
+        return None
+
+    score_candidates = [
+        wd for wd in words
+        if wd["text"].isdigit() and wd["y"] < header_y and len(wd["text"]) <= 2
+        and w * 0.30 < wd["x"] < w * 0.70
+    ]
+    score_candidates.sort(key=lambda wd: wd["x"])
+    blue_score = orange_score = None
+    if len(score_candidates) >= 2:
+        try:
+            blue_score   = int(score_candidates[0]["text"])
+            orange_score = int(score_candidates[1]["text"])
+        except ValueError:
+            blue_score = orange_score = None
+
+    return {"rows": rows, "blue_score": blue_score, "orange_score": orange_score}
+
+
+def _match_ocr_to_roster(m: dict, ocr: dict) -> tuple:
+    """
+    Сопоставляет распознанные строки (по external_id) с реальными игроками
+    матча m (ct/t списки uid). Возвращает (kd_by_uid, side_win, unmatched, missing).
+      kd_by_uid  — {uid: (kills, deaths)} для всех сматченных игроков
+      side_win   — "ct"/"t"/None (None — не смогли определить победителя)
+      unmatched  — распознанные строки, чей external_id не принадлежит ни одному
+                   игроку этого матча (мусор/OCR-ошибка)
+      missing    — реальные игроки матча, для которых бот не нашёл строку
+    """
+    all_uids = [u for u in (m.get("ct", []) + m.get("t", [])) if not _is_bot_uid(u)]
+    ext_to_uid = {}
+    for uid in all_uids:
+        p = get_player(uid)
+        if p.external_id:
+            ext_to_uid[str(p.external_id)] = uid
+
+    kd_by_uid: Dict[int, tuple] = {}
+    unmatched: List[str] = []
+    matched_uids = set()
+    row_team_of_uid: Dict[int, str] = {}
+
+    for row in ocr["rows"]:
+        gid = row["external_id"]
+        uid = ext_to_uid.get(gid)
+        if uid is None:
+            unmatched.append(f"{row.get('nickname') or '?'} [ID {gid}]")
+            continue
+        kd_by_uid[uid] = (row["kills"], row["deaths"])
+        matched_uids.add(uid)
+        row_team_of_uid[uid] = row["team"]
+
+    missing = [get_player(u).nickname for u in all_uids if u not in matched_uids]
+
+    # ── Определяем победившую сторону ────────────────────────────────
+    side_win = None
+    if ocr.get("blue_score") is not None and ocr.get("orange_score") is not None:
+        winning_color = "blue" if ocr["blue_score"] > ocr["orange_score"] else (
+            "orange" if ocr["orange_score"] > ocr["blue_score"] else None
+        )
+        if winning_color:
+            # Какая физическая сторона (ct/t в базе) соответствует этому цвету?
+            # Смотрим, к какой db-стороне принадлежит большинство игроков с этим цветом.
+            ct_set = set(m.get("ct", []))
+            color_uids = [u for u, c in row_team_of_uid.items() if c == winning_color]
+            if color_uids:
+                ct_hits = sum(1 for u in color_uids if u in ct_set)
+                side_win = "ct" if ct_hits >= len(color_uids) / 2 else "t"
+
+    return kd_by_uid, side_win, unmatched, missing
+
+
 async def scoreboard_photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Игрок присылает в группу скриншот результатов с подписью, где есть номер матча
@@ -4077,24 +4506,93 @@ async def scoreboard_photo_handler(update: Update, context: ContextTypes.DEFAULT
         parse_mode=ParseMode.HTML,
     )
 
-    if ADMIN_GROUP_ID:
-        try:
-            await context.bot.forward_message(
-                chat_id=ADMIN_GROUP_ID,
-                from_chat_id=msg.chat_id,
-                message_id=msg.message_id,
-            )
-            await context.bot.send_message(
-                chat_id=ADMIN_GROUP_ID,
-                text=(
-                    f"📸 Скрин результатов матча #{m_id}\n"
-                    f"От: <a href=\"tg://user?id={uid}\">{p.nickname}</a>\n"
-                    f"Проверьте вручную и при необходимости скорректируйте /result / /elo."
-                ),
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception as e:
-            print(f"[scoreboard] admin notify error: {e}")
+    if not ADMIN_GROUP_ID:
+        return
+
+    # ── Пробуем распознать результат сами (OCR) ──────────────────────────
+    ocr_result = None
+    kd_by_uid: Dict[int, tuple] = {}
+    side_win = None
+    unmatched: List[str] = []
+    missing: List[str] = []
+    try:
+        photo_file = await msg.photo[-1].get_file()
+        photo_bytes = bytes(await photo_file.download_as_bytearray())
+        ocr_result = parse_scoreboard_ocr(photo_bytes)
+        if ocr_result:
+            kd_by_uid, side_win, unmatched, missing = _match_ocr_to_roster(m, ocr_result)
+    except Exception as e:
+        print(f"[scoreboard] ocr error: {e!r}")
+        ocr_result = None
+
+    try:
+        await context.bot.forward_message(
+            chat_id=ADMIN_GROUP_ID,
+            from_chat_id=msg.chat_id,
+            message_id=msg.message_id,
+        )
+    except Exception as e:
+        print(f"[scoreboard] admin forward error: {e}")
+
+    ocr_ok = bool(ocr_result) and side_win is not None and not unmatched and not missing and len(kd_by_uid) >= 2
+
+    if not ocr_ok:
+        reasons = []
+        if not _ocr_available():
+            reasons.append("на сервере не настроен OCR (tesseract)")
+        elif not ocr_result:
+            reasons.append("не нашёл таблицу на скрине (плохой ракурс/качество)")
+        else:
+            if side_win is None:
+                reasons.append("не разобрал счёт команд")
+            if unmatched:
+                reasons.append("есть нераспознанные/чужие ID: " + ", ".join(unmatched))
+            if missing:
+                reasons.append("не нашёл строку для: " + ", ".join(missing))
+        await context.bot.send_message(
+            chat_id=ADMIN_GROUP_ID,
+            text=(
+                f"📸 Скрин результатов матча #{m_id}\n"
+                f"От: <a href=\"tg://user?id={uid}\">{p.nickname}</a>\n\n"
+                f"⚠️ Бот не смог уверенно распознать результат автоматически "
+                f"({'; '.join(reasons) if reasons else 'неизвестная причина'}).\n"
+                f"Проверьте вручную и введите <code>/win {m_id} ct|t ...</code>."
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # ── Уверенно распознали — предлагаем админу подтвердить одной кнопкой ──
+    db["pending_ocr"][m_id] = {
+        "side":       side_win,
+        "kd_by_uid":  {str(k): list(v) for k, v in kd_by_uid.items()},
+        "reported_by": uid,
+    }
+    save_db(db)
+
+    win_label = "🔵 CT" if side_win == "ct" else "🔴 T"
+    lines = []
+    for u, (k, d) in kd_by_uid.items():
+        pl = get_player(u)
+        side_tag = "🏆" if (u in m.get(side_win, [])) else "❌"
+        lines.append(f"  {side_tag} {pl.nickname}: {k}/{d}")
+
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Подтвердить и применить", callback_data=f"ocrwin_confirm:{m_id}"),
+        InlineKeyboardButton("✏️ Ввести вручную",         callback_data=f"ocrwin_manual:{m_id}"),
+    ]])
+
+    await context.bot.send_message(
+        chat_id=ADMIN_GROUP_ID,
+        text=(
+            f"🤖 <b>Матч #{m_id}</b> — бот распознал результат по скрину:\n\n"
+            f"Победила сторона: {win_label}\n" + "\n".join(lines) +
+            f"\n\nОт: <a href=\"tg://user?id={uid}\">{p.nickname}</a>\n\n"
+            f"Проверьте и подтвердите, либо введите вручную через /win."
+        ),
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb,
+    )
 
 
 # ════════════════════════════════════════════════
@@ -4411,7 +4909,6 @@ async def win_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     winners = m.get("ct", []) if side == "ct" else m.get("t", [])
     losers  = m.get("t", [])  if side == "ct" else m.get("ct", [])
-    mode    = m.get("mode", "5v5")
     all_uids = [u for u in (winners + losers) if not _is_bot_uid(u)]
 
     # ── Парсим строки вида "ID 6888 — 2 убийства — 8 смертей." ─────────────
@@ -4481,132 +4978,10 @@ async def win_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML
         )
 
-    win_lines:  List[str] = []
-    loss_lines: List[str] = []
-    elo_snapshot: Dict[str, dict] = {}
-    calib_notifications: List[tuple] = []  # (user_id, start_elo, level) — для ЛС-уведомлений
-
-    def _apply(target_uid: int, won: bool, lines: List[str]) -> None:
-        if _is_bot_uid(target_uid):
-            return
-        s = str(target_uid)
-        pdata = db["players"].get(s)
-        if not pdata:
-            return
-
-        platform      = pdata.get("platform", "pc")
-        win_d, loss_d = elo_deltas_for(platform)
-
-        elo_before      = pdata.get("elo", 0)
-        elo_mode_before = pdata.get(f"elo_{mode}", 0)
-        games_before     = pdata.get("wins", 0) + pdata.get("losses", 0)
-        was_calibrated   = games_before >= CALIBRATION_GAMES
-
-        # Во время калибровки ЭЛО не начисляется и не списывается — игрок
-        # копит только W/L, а стартовый ранг ему присвоит бот по итогам всех
-        # калибровочных матчей (см. ниже). После калибровки — обычное начисление.
-        if was_calibrated:
-            delta = win_d if won else -loss_d
-            for field, before in (("elo", elo_before), (f"elo_{mode}", elo_mode_before)):
-                pdata[field] = max(ELO_MIN, before + delta)
-
-        if won:
-            pdata["wins"]            = pdata.get("wins", 0) + 1
-            pdata[f"wins_{mode}"]    = pdata.get(f"wins_{mode}", 0) + 1
-        else:
-            pdata["losses"]          = pdata.get("losses", 0) + 1
-            pdata[f"losses_{mode}"]  = pdata.get(f"losses_{mode}", 0) + 1
-
-        w, l   = pdata.get("wins", 0), pdata.get("losses", 0)
-        wm, lm = pdata.get(f"wins_{mode}", 0), pdata.get(f"losses_{mode}", 0)
-        pdata["avg"]          = round(w / (w + l) * 100, 1) if (w + l) else 0.0
-        pdata[f"avg_{mode}"]  = round(wm / (wm + lm) * 100, 1) if (wm + lm) else 0.0
-
-        games_after    = w + l
-        calib_done_now = (not was_calibrated) and games_after >= CALIBRATION_GAMES
-        start_elo      = None
-        if calib_done_now:
-            # Калибровка только что завершилась этим матчем — бот сам решает
-            # стартовый ранг по проценту побед за все калибровочные матчи.
-            # Формула умеренная: 50% побед ≈ CALIBRATION_BASE_ELO, а не крайние
-            # значения диапазона, чтобы 4-5 матчей не давали сразу высокий ранг.
-            win_rate  = (w / games_after) if games_after else 0.0
-            start_elo = int(round(CALIBRATION_BASE_ELO + (win_rate - 0.5) * CALIBRATION_SWING))
-            start_elo = max(ELO_MIN, min(2000, start_elo))
-            pdata["elo"]         = start_elo
-            pdata[f"elo_{mode}"] = start_elo
-            calib_notifications.append((target_uid, start_elo, _lvl_number(start_elo)))
-
-        # ── Киллы/смерти за матч → накопительный средний KD ────────────────
-        kills, deaths = kd_by_uid.get(target_uid, (0, 0))
-        pdata["total_kills"]  = pdata.get("total_kills", 0) + kills
-        pdata["total_deaths"] = pdata.get("total_deaths", 0) + deaths
-        total_kd = round(pdata["total_kills"] / pdata["total_deaths"], 2) if pdata["total_deaths"] else float(pdata["total_kills"])
-
-        nick   = pdata.get("nickname", "?")
-        kd_txt = (
-            f"{kills}/{deaths} (KD матча {round(kills/deaths, 2) if deaths else kills}) | "
-            f"общий KD: <b>{total_kd}</b>"
-        )
-
-        if calib_done_now:
-            lines.append(
-                f"  • {nick}: 🔄→✅ <b>калибровка завершена!</b> Стартовый ранг: <b>{start_elo}</b> ELO | {kd_txt}"
-            )
-        elif was_calibrated:
-            sign    = "+" if won else "-"
-            applied = win_d if won else loss_d
-            lines.append(
-                f"  • {nick}: {sign}{applied} ELO → <b>{pdata['elo']}</b> | {kd_txt}"
-            )
-        else:
-            lines.append(
-                f"  • {nick}: 🔄 калибровочный матч ({games_after}/{CALIBRATION_GAMES}), ранг ещё не присвоен | {kd_txt}"
-            )
-
-        elo_snapshot[s] = {
-            "elo_before":      elo_before,
-            "elo_mode_before": elo_mode_before,
-            "elo_after":       pdata["elo"],
-            "elo_mode_after":  pdata[f"elo_{mode}"],
-        }
-
-    for uid in winners:
-        _apply(uid, True, win_lines)
-    for uid in losers:
-        _apply(uid, False, loss_lines)
-
-    # ── ЛС-уведомление игрокам, которые только что прошли калибровку ────────
-    for cal_uid, cal_elo, cal_lvl in calib_notifications:
-        try:
-            await context.bot.send_message(
-                chat_id=cal_uid,
-                text=(
-                    f"✅ <b>Вы прошли калибровку!</b>\n\n"
-                    f"Сыграно {CALIBRATION_GAMES} калибровочных матчей — "
-                    f"бот определил ваш стартовый уровень.\n\n"
-                    f"🏆 Уровень: <b>{cal_lvl}</b>\n"
-                    f"📊 ELO: <b>{cal_elo}</b>\n\n"
-                    f"Дальше ЭЛО меняется за каждую победу/поражение — удачи!"
-                ),
-                parse_mode=ParseMode.HTML
-            )
-        except Exception as e:
-            print(f"⚠️ Не удалось отправить ЛС о калибровке uid={cal_uid}: {e!r}")
-
-    # ── Сохраняем снапшот для возможной отмены (/cancelwin) ─────────────────
-    kd_snapshot = {str(uid): list(kd_by_uid.get(uid, (0, 0))) for uid in all_uids}
-    db.setdefault("finished_matches", {})[m_id] = {
-        "mode":         mode,
-        "map":          m["maps"][0] if m.get("maps") else None,
-        "winners":      winners,
-        "losers":       losers,
-        "kd_by_uid":    kd_snapshot,
-        "elo_snapshot": elo_snapshot,
-        "finished_ts":  datetime.now().timestamp(),
-    }
-
-    db["active_matches"].pop(m_id, None)
+    win_lines, loss_lines, calib_notifications, mode, winners, losers = _finalize_match(
+        db, m_id, m, side, kd_by_uid
+    )
+    await _send_calibration_dms(context.bot, calib_notifications)
     save_db(db)
 
     win_side_label  = "🔵 CT" if side == "ct" else "🔴 T"
