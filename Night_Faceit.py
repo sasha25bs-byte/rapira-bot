@@ -12,7 +12,7 @@ import io
 import math
 import aiohttp
 from aiohttp import web
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, MenuButtonWebApp, WebAppInfo,
     ChatPermissions, BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats, BotCommandScopeDefault,
@@ -1904,17 +1904,22 @@ def _card_draw_donut(d: ImageDraw.ImageDraw, cx: float, cy: float, r: float,
         ly += 24
 
 
-def _make_gradient(w: int, h: int, c1: tuple, c2: tuple) -> Image.Image:
-    """Диагональный градиент c1 → c2 размером w×h (numpy, быстро)."""
-    import numpy as np
-    x = np.linspace(0.0, 1.0, w)
-    y = np.linspace(0.0, 1.0, h)
-    xx, yy = np.meshgrid(x, y)
-    t = (xx + yy) / 2.0
-    a = np.array(c1, dtype=float)
-    b = np.array(c2, dtype=float)
-    arr = (a[None, None, :] * (1 - t[..., None]) + b[None, None, :] * t[..., None]).astype("uint8")
-    return Image.fromarray(arr, "RGB")
+def _make_gradient(w: int, h: int, c1: tuple, c2: tuple, steps: int = 48) -> Image.Image:
+    """Диагональный градиент c1 (верх-лево) → c2 (низ-право), размером w×h.
+    Чистый PIL/Python, без numpy — строим маленькую сетку steps×steps и
+    растягиваем её билинейно, это быстро и не тянет лишних зависимостей
+    (numpy не всегда стоит на проде — ровно так же ломался Pillow раньше)."""
+    small = Image.new("RGB", (steps, steps))
+    px = small.load()
+    denom = max(1, 2 * (steps - 1))
+    for j in range(steps):
+        for i in range(steps):
+            t = (i + j) / denom
+            r = int(c1[0] + (c2[0] - c1[0]) * t)
+            g = int(c1[1] + (c2[1] - c1[1]) * t)
+            b = int(c1[2] + (c2[2] - c1[2]) * t)
+            px[i, j] = (r, g, b)
+    return small.resize((w, h), Image.BILINEAR)
 
 
 def _card_section_title(d: ImageDraw.ImageDraw, x: int, y: int, text: str, font,
@@ -2024,7 +2029,7 @@ def render_stats_card(target: int, out_path: str, group_name: str = "NightFaceit
     # ── ШАПКА (градиентный баннер) ──────────────────────────────────────
     header_box = [MARGIN, 24, W - MARGIN, 24 + HEADER_H - 24]
     grad_w, grad_h = header_box[2] - header_box[0], header_box[3] - header_box[1]
-    gradient = _make_gradient(grad_w, grad_h, (46, 22, 74), (132, 40, 118))
+    gradient = _make_gradient(grad_w, grad_h, (10, 8, 16), (40, 22, 52))
     mask = Image.new("L", (grad_w, grad_h), 0)
     ImageDraw.Draw(mask).rounded_rectangle([0, 0, grad_w - 1, grad_h - 1], radius=18, fill=255)
     img.paste(gradient, (header_box[0], header_box[1]), mask)
@@ -2054,6 +2059,15 @@ def render_stats_card(target: int, out_path: str, group_name: str = "NightFaceit
         d.text((bx + 14, by + 8 - btb[1]), btxt, font=bf, fill=bcol)
 
     pill_w = 220
+    glow_cx, glow_cy = W - MARGIN - pill_w + 32, 40 + 26
+    glow_r = 60
+    glow = Image.new("RGBA", (W, CANVAS_H), (0, 0, 0, 0))
+    ImageDraw.Draw(glow).ellipse(
+        [glow_cx - glow_r, glow_cy - glow_r, glow_cx + glow_r, glow_cy + glow_r],
+        fill=(160, 110, 255, 110))
+    glow = glow.filter(ImageFilter.GaussianBlur(22))
+    img.paste(glow.convert("RGB"), (0, 0), glow)
+
     d.rounded_rectangle([W - MARGIN - pill_w, 40, W - MARGIN, 40 + 52], radius=14,
                          fill=(18, 14, 26), outline=(150, 90, 160), width=1)
     _card_draw_logo_icon(d, W - MARGIN - pill_w + 32, 40 + 26, 30)
@@ -2077,9 +2091,14 @@ def render_stats_card(target: int, out_path: str, group_name: str = "NightFaceit
     donut_cy = yl + 78
 
     kd_fill = (p.total_kills / (p.total_kills + p.total_deaths)) if (p.total_kills + p.total_deaths) else 0.0
-    _card_draw_donut(d, cx_kd, donut_cy, 58, kd_fill, f"{kd:.2f}",
-                      [f"K = {p.total_kills}   D = {p.total_deaths}"],
-                      f_donut, f_small, ring_color=(124, 92, 255))
+    if total_games == 0:
+        _card_draw_donut(d, cx_kd, donut_cy, 58, 0.0, "?",
+                          ["K = 0   D = 0"],
+                          f_donut, f_small, ring_color=(70, 60, 90))
+    else:
+        _card_draw_donut(d, cx_kd, donut_cy, 58, kd_fill, f"{kd:.2f}",
+                          [f"K = {p.total_kills:,}   D = {p.total_deaths:,}"],
+                          f_donut, f_small, ring_color=(124, 92, 255))
 
     if p.is_calibrated:
         level, lo, hi = _elo_bounds(p.elo)
@@ -2097,7 +2116,7 @@ def render_stats_card(target: int, out_path: str, group_name: str = "NightFaceit
         if fill_w > 0:
             d.rounded_rectangle([bar_x, bar_y, bar_x + fill_w, bar_y + 12], radius=6, fill=lvl_color)
         d.text((bar_x, bar_y + 20), str(lo), font=f_tiny, fill=_CARD_GRAY)
-        cur_txt = str(p.elo)
+        cur_txt = f"{p.elo:,}"
         ctb = d.textbbox((0, 0), cur_txt, font=f_box_val)
         d.text((cx_lvl - (ctb[2]-ctb[0])/2, yl + 48), cur_txt, font=f_box_val, fill=_CARD_WHITE)
         hi_txt = str(hi)
@@ -2143,8 +2162,12 @@ def render_stats_card(target: int, out_path: str, group_name: str = "NightFaceit
     row3_h = 190
     d.rounded_rectangle([MARGIN, yl, MARGIN + row_w, yl + row3_h], radius=16,
                          fill=_CARD_ROW_BG, outline=_CARD_ROW_BORDER, width=1)
-    _card_draw_donut(d, MARGIN + row_w/2, yl + 78, 58, wr/100, f"{wr:.0f}%",
-                      [f"W = {p.wins}   L = {p.losses}"], f_donut, f_small, ring_color=(90, 220, 140))
+    if total_games == 0:
+        _card_draw_donut(d, MARGIN + row_w/2, yl + 78, 58, 0.0, "?",
+                          ["W = 0   L = 0"], f_donut, f_small, ring_color=(70, 60, 90))
+    else:
+        _card_draw_donut(d, MARGIN + row_w/2, yl + 78, 58, wr/100, f"{wr:.0f}%",
+                          [f"W = {p.wins}   L = {p.losses}"], f_donut, f_small, ring_color=(90, 220, 140))
 
     mx0 = MARGIN + row_w + GAP
     d.rounded_rectangle([mx0, yl, mx0 + row_w, yl + row3_h], radius=16,
@@ -2180,7 +2203,7 @@ def render_stats_card(target: int, out_path: str, group_name: str = "NightFaceit
     d.text((RIGHT_X + 20, yr + 18), "Платформа", font=f_box_lb, fill=_CARD_GRAY)
     d.text((RIGHT_X + 20, yr + 44), plat_label, font=f_box_val, fill=_CARD_WHITE)
     d.text((RIGHT_X + half_w + 10, yr + 18), "Матчей", font=f_box_lb, fill=_CARD_GRAY)
-    d.text((RIGHT_X + half_w + 10, yr + 44), str(total_games), font=f_box_val, fill=_CARD_WHITE)
+    d.text((RIGHT_X + half_w + 10, yr + 44), f"{total_games:,}", font=f_box_val, fill=_CARD_WHITE)
 
     reg_label = (datetime.fromtimestamp(p.registered_ts).strftime("%d.%m.%Y")
                  if getattr(p, "registered_ts", 0) else "—")
@@ -2216,7 +2239,7 @@ def render_stats_card(target: int, out_path: str, group_name: str = "NightFaceit
             d.text((RIGHT_X + 16, ry2 + 6), f"#{i}", font=f_box_lb, fill=col)
             nm = rp.nickname if len(rp.nickname) <= 16 else rp.nickname[:15] + "…"
             d.text((RIGHT_X + 56, ry2 + 6), nm, font=f_box_lb, fill=_CARD_WHITE if not is_me else _CARD_PURPLE_LIT)
-            etxt = str(rp.elo)
+            etxt = f"{rp.elo:,}"
             etb = d.textbbox((0, 0), etxt, font=f_box_lb)
             d.text((RIGHT_X + RIGHT_W - 16 - (etb[2]-etb[0]), ry2 + 6), etxt, font=f_box_lb, fill=_CARD_GRAY)
             ry2 += 46
@@ -2226,7 +2249,7 @@ def render_stats_card(target: int, out_path: str, group_name: str = "NightFaceit
             d.text((RIGHT_X + 16, ry2 + 6), f"#{rank_info[0]}", font=f_box_lb, fill=_CARD_PURPLE_LIT)
             nm = p.nickname if len(p.nickname) <= 16 else p.nickname[:15] + "…"
             d.text((RIGHT_X + 56, ry2 + 6), nm, font=f_box_lb, fill=_CARD_PURPLE_LIT)
-            etxt = str(p.elo)
+            etxt = f"{p.elo:,}"
             etb = d.textbbox((0, 0), etxt, font=f_box_lb)
             d.text((RIGHT_X + RIGHT_W - 16 - (etb[2]-etb[0]), ry2 + 6), etxt, font=f_box_lb, fill=_CARD_PURPLE_LIT)
 
