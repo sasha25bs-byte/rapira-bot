@@ -113,6 +113,17 @@ ELO_LOSS_MOBILE  = 20
 ELO_MIN      = 100
 BOT_ID_START = -100000
 
+# ── СТАРТОВЫЙ РАНГ ПОСЛЕ КАЛИБРОВКИ ──────────────────────────────────
+# После CALIBRATION_GAMES матчей боту нужно выдать игроку стартовый ELO.
+# Раньше формула растягивала винрейт на весь диапазон 100–2000, из-за чего
+# всего 4 победы и 1 поражение (80%) сразу давали ~1600 ELO — это слишком
+# много для пяти матчей и ломало баланс топа. Теперь используем умеренную
+# базу: средний игрок (50% побед) стартует около CALIBRATION_BASE_ELO,
+# а винрейт лишь немного сдвигает его в ту или иную сторону
+# (± CALIBRATION_SWING / 2 при 100%/0% побед).
+CALIBRATION_BASE_ELO  = 1000
+CALIBRATION_SWING     = 800
+
 
 def elo_deltas_for(platform: str) -> tuple:
     """Возвращает (плюс_за_победу, минус_за_поражение) в зависимости от платформы."""
@@ -1576,6 +1587,33 @@ def build_stats_text(target: int, looking_at_self: bool, private_chat: bool = Tr
     return (text, kb)
 
 
+async def _fetch_avatar_path(bot, user_id: int) -> Optional[str]:
+    """Скачивает текущую аватарку пользователя из его Telegram-профиля во
+    временный файл и возвращает путь к нему. Возвращает None, если у
+    пользователя нет фото профиля или скачать не получилось — в этом случае
+    карточка нарисует прежний плейсхолдер вместо аватарки."""
+    try:
+        photos = await bot.get_user_profile_photos(user_id, limit=1)
+        if not photos or photos.total_count == 0:
+            return None
+        file_id = photos.photos[0][-1].file_id
+        tg_file = await bot.get_file(file_id)
+        import io
+        buf = io.BytesIO()
+        await tg_file.download_to_memory(buf)
+        buf.seek(0)
+        avatar_path = _os.path.join(
+            _os.path.dirname(_os.path.abspath(__file__)),
+            f"_avatar_{user_id}.jpg"
+        )
+        with open(avatar_path, "wb") as f:
+            f.write(buf.read())
+        return avatar_path
+    except Exception as e:
+        print(f"⚠️ Не удалось скачать аватар Telegram user_id={user_id}: {e!r}")
+        return None
+
+
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await dm_buttons_only(update): return
     try:
@@ -1605,14 +1643,18 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _os.path.dirname(_os.path.abspath(__file__)),
             f"_stats_card_{target}_{update.effective_chat.id}.png"
         )
+        avatar_path = await _fetch_avatar_path(context.bot, target)
         result = None
         try:
-            result = render_stats_card(target, card_path)
+            result = render_stats_card(target, card_path, avatar_path=avatar_path)
         except Exception as e:
             print(f"⚠️ Не удалось сгенерировать карточку профиля uid={target}: {e!r}")
             result = None
 
         if not result:
+            if avatar_path:
+                try: os.remove(avatar_path)
+                except OSError: pass
             await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
             return
 
@@ -1624,6 +1666,9 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 os.remove(result)
             except OSError:
                 pass
+            if avatar_path:
+                try: os.remove(avatar_path)
+                except OSError: pass
     except Exception as e:
         import traceback
         print(f"[stats_cmd ERROR] uid={update.effective_user.id} error={e}\n{traceback.format_exc()}")
@@ -2075,6 +2120,29 @@ def _card_cover_crop(im: Image.Image, w: int, h: int) -> Image.Image:
     return im.crop((x0, y0, x0 + w, y0 + h))
 
 
+def _card_draw_avatar(img: Image.Image, d: ImageDraw.ImageDraw, cx: float, cy: float, r: float,
+                       avatar_path: Optional[str], border=(210, 190, 255)) -> None:
+    """Рисует круглую аватарку игрока (реальное фото профиля из Telegram) в
+    шапке карточки. Если путь не передан или картинку не удалось открыть —
+    рисует прежний плейсхолдер (иконку-лого), карточка не ломается."""
+    size = int(r * 2)
+    photo = None
+    if avatar_path:
+        try:
+            photo = _card_cover_crop(Image.open(avatar_path).convert("RGB"), size, size).convert("RGBA")
+        except Exception as e:
+            print(f"⚠️ Не удалось открыть аватар {avatar_path}: {e!r}")
+            photo = None
+    if photo is None:
+        _card_draw_logo_icon(d, cx, cy, size, bg=(18, 14, 30), border=border)
+        return
+    mask = Image.new("L", (size, size), 0)
+    ImageDraw.Draw(mask).ellipse([0, 0, size - 1, size - 1], fill=255)
+    x0, y0 = int(cx - r), int(cy - r)
+    img.paste(photo.convert("RGB"), (x0, y0), mask)
+    d.ellipse([x0, y0, x0 + size, y0 + size], outline=border, width=2)
+
+
 def _card_map_panel(img: Image.Image, d: ImageDraw.ImageDraw, x0: float, y0: float, x1: float, y1: float,
                      map_name: str):
     """Рисует панель карты в блоке «Статистика по карте»: реальное фото карты,
@@ -2119,15 +2187,8 @@ def _card_map_panel(img: Image.Image, d: ImageDraw.ImageDraw, x0: float, y0: flo
     img.paste(photo.convert("RGB"), (x0, y0), mask)
     d.rounded_rectangle([x0, y0, x1 - 1, y1 - 1], radius=radius, outline=_CARD_ROW_BORDER, width=1)
 
-    chip = 38
-    chip_cx, chip_cy = x0 + 14 + chip / 2, y1 - 14 - chip / 2
-    d.rounded_rectangle([chip_cx - chip / 2, chip_cy - chip / 2, chip_cx + chip / 2, chip_cy + chip / 2],
-                         radius=10, fill=(30, 26, 46), outline=_CARD_PURPLE_LIT, width=2)
-    initials = "".join(word[0] for word in map_name.split()[:2]).upper() or "?"
-    f_chip = _card_font(15)
-    _card_center_text(d, chip_cx, chip_cy, initials, f_chip, _CARD_PURPLE_LIT)
-
-    name_x = chip_cx + chip / 2 + 12
+    # Только название карты внизу панели — без отдельной иконки с буквами.
+    name_x = x0 + 14
     f_name = _card_font(21)
     d.text((name_x, y1 - 14 - 22), map_name.upper(), font=f_name, fill=_CARD_WHITE)
 
@@ -2154,7 +2215,8 @@ def _elo_bounds(elo: int) -> tuple:
     return 1, 0, 500
 
 
-def render_stats_card(target: int, out_path: str, group_name: str = "NightFaceit") -> Optional[str]:
+def render_stats_card(target: int, out_path: str, group_name: str = "NightFaceit",
+                       avatar_path: Optional[str] = None) -> Optional[str]:
     """Рисует PNG-карточку личного профиля игрока (двухколоночная вёрстка) с
     актуальными данными из БД. Возвращает out_path, либо None если игрок не
     зарегистрирован / бот. Никаких выдуманных метрик (Rating/Impact/MVP/HS%/KPR
@@ -2247,7 +2309,7 @@ def render_stats_card(target: int, out_path: str, group_name: str = "NightFaceit
     d.rounded_rectangle(header_box, radius=18, outline=(150, 90, 160), width=1)
 
     avatar_cx, avatar_cy, avatar_r = 90, 24 + (HEADER_H - 24) / 2, 42
-    _card_draw_logo_icon(d, avatar_cx, avatar_cy, 86, bg=(18, 14, 30), border=(210, 190, 255))
+    _card_draw_avatar(img, d, avatar_cx, avatar_cy, avatar_r, avatar_path, border=(210, 190, 255))
     dot_r = 9
     dot_cx, dot_cy = avatar_cx + avatar_r * 0.72, avatar_cy + avatar_r * 0.72
     d.ellipse([dot_cx - dot_r - 3, dot_cy - dot_r - 3, dot_cx + dot_r + 3, dot_cy + dot_r + 3], fill=(18, 14, 30))
@@ -2880,6 +2942,57 @@ async def resetdb_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.HTML
     )
 
+async def newseason_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Только владелец — начинает новый сезон: обнуляет ВСЮ игровую статистику
+    (победы/поражения по режимам, ЭЛО, средний винрейт, киллы/смерти) у всех
+    зарегистрированных игроков, но НЕ удаляет самих игроков — их ID, ник,
+    платформа и факт регистрации сохраняются, заново регистрироваться не
+    нужно. Все игроки заново проходят калибровку.
+    Для защиты от случайного запуска требует подтверждения: /newseason confirm"""
+    if not is_creator(update.effective_user.id):
+        return
+
+    if not context.args or context.args[0].lower() != "confirm":
+        await update.message.reply_text(
+            "⚠️ <b>Это обнулит статистику ВСЕХ игроков</b> (победы, поражения, ЭЛО, K/D) "
+            "и начнёт новый сезон. Регистрация игроков сохранится.\n\n"
+            "Чтобы подтвердить, отправьте:\n<code>/newseason confirm</code>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    db = load_db()
+    players = db.get("players", {})
+    reset_fields = {
+        "wins": 0, "losses": 0,
+        "wins_5v5": 0, "losses_5v5": 0,
+        "wins_2v2": 0, "losses_2v2": 0,
+        "avg": 0.0, "avg_5v5": 0.0, "avg_2v2": 0.0,
+        "elo": 0, "elo_5v5": 0, "elo_2v2": 0,
+        "total_kills": 0, "total_deaths": 0,
+    }
+    reset_count = 0
+    for s, pdata in players.items():
+        if pdata.get("is_bot"):
+            continue
+        for field, val in reset_fields.items():
+            pdata[field] = val
+        reset_count += 1
+
+    save_db(db)
+    await _sync_db_to_telegram()
+    await update.message.reply_text(
+        f"🆕 <b>Новый сезон начат!</b>\n\n"
+        f"Статистика обнулена у <b>{reset_count}</b> игроков: победы, поражения, "
+        f"ЭЛО и K/D сброшены в 0.\n"
+        f"Регистрация, никнеймы, ID и платформы сохранены — заново регистрироваться "
+        f"НЕ нужно.\n"
+        f"Все игроки снова проходят калибровку ({CALIBRATION_GAMES} матчей), "
+        f"прежде чем получат новый ранг.",
+        parse_mode=ParseMode.HTML
+    )
+
+
 async def addadm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Только создатель — добавить админа"""
     if not is_creator(update.effective_user.id): return
@@ -3353,9 +3466,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _os.path.dirname(_os.path.abspath(__file__)),
             f"_stats_card_{uid}_{q.message.chat.id if q.message else uid}.png"
         )
+        avatar_path = await _fetch_avatar_path(context.bot, uid)
         result = None
         try:
-            result = render_stats_card(uid, card_path)
+            result = render_stats_card(uid, card_path, avatar_path=avatar_path)
         except Exception as e:
             print(f"⚠️ Не удалось сгенерировать карточку профиля (кнопка) uid={uid}: {e!r}")
             result = None
@@ -3364,6 +3478,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _menu_send_photo(q, result, back_kb)
         else:
             await _menu_edit(q, text, back_kb)
+        if avatar_path:
+            try: os.remove(avatar_path)
+            except OSError: pass
         return
 
     # ── ТОП ИГРОКОВ ───────────────────────────────────────────────────────────
@@ -4383,8 +4500,11 @@ async def win_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if calib_done_now:
             # Калибровка только что завершилась этим матчем — бот сам решает
             # стартовый ранг по проценту побед за все калибровочные матчи.
+            # Формула умеренная: 50% побед ≈ CALIBRATION_BASE_ELO, а не крайние
+            # значения диапазона, чтобы 4-5 матчей не давали сразу высокий ранг.
             win_rate  = (w / games_after) if games_after else 0.0
-            start_elo = int(round(ELO_MIN + win_rate * (2000 - ELO_MIN)))
+            start_elo = int(round(CALIBRATION_BASE_ELO + (win_rate - 0.5) * CALIBRATION_SWING))
+            start_elo = max(ELO_MIN, min(2000, start_elo))
             pdata["elo"]         = start_elo
             pdata[f"elo_{mode}"] = start_elo
 
@@ -5498,6 +5618,7 @@ async def run_bot():
     app.add_handler(CommandHandler("addadm",     addadm_cmd))
     app.add_handler(CommandHandler("removeadm",  removeadm_cmd))
     app.add_handler(CommandHandler("resetdb",    resetdb_cmd))
+    app.add_handler(CommandHandler("newseason",  newseason_cmd))
 
     app.add_handler(CommandHandler("ticket",      ticket_cmd))
     app.add_handler(CommandHandler("reply",       reply_cmd))
