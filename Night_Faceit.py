@@ -1614,6 +1614,18 @@ async def _fetch_avatar_path(bot, user_id: int) -> Optional[str]:
         return None
 
 
+async def _fetch_avatar_paths(bot, user_ids: List[int]) -> Dict[int, str]:
+    """Скачивает аватарки сразу нескольких игроков (для карточки топа).
+    Возвращает {user_id: путь_к_файлу} только для тех, у кого получилось
+    скачать фото профиля; остальные останутся с плейсхолдером."""
+    result: Dict[int, str] = {}
+    for uid in user_ids:
+        path = await _fetch_avatar_path(bot, uid)
+        if path:
+            result[uid] = path
+    return result
+
+
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await dm_buttons_only(update): return
     try:
@@ -1807,7 +1819,8 @@ def build_top_players(limit: int = 10) -> List[Player]:
     return players[:limit]
 
 
-def render_top_card(out_path: str, group_name: str = "NightFaceit", limit: int = 10) -> Optional[str]:
+def render_top_card(out_path: str, group_name: str = "NightFaceit", limit: int = 10,
+                     avatar_paths: Optional[Dict[int, str]] = None) -> Optional[str]:
     """Рисует PNG-карточку топ-игроков (актуальные данные из БД) и сохраняет в out_path.
     Возвращает out_path, либо None если рейтинг пуст."""
     players = build_top_players(limit)
@@ -1847,7 +1860,8 @@ def render_top_card(out_path: str, group_name: str = "NightFaceit", limit: int =
                              fill=_CARD_ROW_BG, outline=_CARD_ROW_BORDER, width=1)
         cy = y + _CARD_ROW_H // 2
         d.text((40 + 24, cy - 16), str(i), font=f_rank, fill=_CARD_WHITE)
-        _card_draw_logo_icon(d, 175 + 38, cy, 58)
+        row_avatar = (avatar_paths or {}).get(p.user_id)
+        _card_draw_avatar(img, d, 175 + 38, cy, 29, row_avatar, border=(150, 90, 160))
 
         name = p.nickname if len(p.nickname) <= 16 else p.nickname[:15] + "…"
         d.text((175 + 90, cy - 15), name, font=f_name, fill=_CARD_WHITE)
@@ -2633,13 +2647,18 @@ async def top_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await gate(update): return
 
     card_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), f"_top_card_{update.effective_chat.id}.png")
+    top_players = build_top_players(10)
+    avatar_paths = await _fetch_avatar_paths(context.bot, [p.user_id for p in top_players])
     try:
-        result = render_top_card(card_path)
+        result = render_top_card(card_path, avatar_paths=avatar_paths)
     except Exception as e:
         print(f"⚠️ Не удалось сгенерировать карточку топа: {e!r}")
         result = None
 
     if not result:
+        for ap in avatar_paths.values():
+            try: os.remove(ap)
+            except OSError: pass
         await update.message.reply_text(build_top_text(), parse_mode=ParseMode.HTML)
         return
 
@@ -2651,6 +2670,9 @@ async def top_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             os.remove(result)
         except OSError:
             pass
+        for ap in avatar_paths.values():
+            try: os.remove(ap)
+            except OSError: pass
 
 
 DM_LOBBY_WARNING = (
@@ -3492,9 +3514,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _os.path.dirname(_os.path.abspath(__file__)),
             f"_top_card_{q.message.chat.id if q.message else uid}.png"
         )
+        top_players = build_top_players(10)
+        avatar_paths = await _fetch_avatar_paths(context.bot, [p.user_id for p in top_players])
         result = None
         try:
-            result = render_top_card(card_path)
+            result = render_top_card(card_path, avatar_paths=avatar_paths)
         except Exception as e:
             print(f"⚠️ Не удалось сгенерировать карточку топа (кнопка): {e!r}")
             result = None
@@ -3503,6 +3527,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _menu_send_photo(q, result, back_kb)
         else:
             await _menu_edit(q, build_top_text(), back_kb)
+        for ap in avatar_paths.values():
+            try: os.remove(ap)
+            except OSError: pass
         return
 
     # ── СЕЗОН ─────────────────────────────────────────────────────────────────
@@ -4457,6 +4484,7 @@ async def win_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     win_lines:  List[str] = []
     loss_lines: List[str] = []
     elo_snapshot: Dict[str, dict] = {}
+    calib_notifications: List[tuple] = []  # (user_id, start_elo, level) — для ЛС-уведомлений
 
     def _apply(target_uid: int, won: bool, lines: List[str]) -> None:
         if _is_bot_uid(target_uid):
@@ -4507,6 +4535,7 @@ async def win_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             start_elo = max(ELO_MIN, min(2000, start_elo))
             pdata["elo"]         = start_elo
             pdata[f"elo_{mode}"] = start_elo
+            calib_notifications.append((target_uid, start_elo, _lvl_number(start_elo)))
 
         # ── Киллы/смерти за матч → накопительный средний KD ────────────────
         kills, deaths = kd_by_uid.get(target_uid, (0, 0))
@@ -4546,6 +4575,24 @@ async def win_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _apply(uid, True, win_lines)
     for uid in losers:
         _apply(uid, False, loss_lines)
+
+    # ── ЛС-уведомление игрокам, которые только что прошли калибровку ────────
+    for cal_uid, cal_elo, cal_lvl in calib_notifications:
+        try:
+            await context.bot.send_message(
+                chat_id=cal_uid,
+                text=(
+                    f"✅ <b>Вы прошли калибровку!</b>\n\n"
+                    f"Сыграно {CALIBRATION_GAMES} калибровочных матчей — "
+                    f"бот определил ваш стартовый уровень.\n\n"
+                    f"🏆 Уровень: <b>{cal_lvl}</b>\n"
+                    f"📊 ELO: <b>{cal_elo}</b>\n\n"
+                    f"Дальше ЭЛО меняется за каждую победу/поражение — удачи!"
+                ),
+                parse_mode=ParseMode.HTML
+            )
+        except Exception as e:
+            print(f"⚠️ Не удалось отправить ЛС о калибровке uid={cal_uid}: {e!r}")
 
     # ── Сохраняем снапшот для возможной отмены (/cancelwin) ─────────────────
     kd_snapshot = {str(uid): list(kd_by_uid.get(uid, (0, 0))) for uid in all_uids}
@@ -5054,8 +5101,11 @@ async def unreg_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if target in db.get(q_key, []):
             db[q_key].remove(target)
 
-    db["players"][s]["external_id"] = ""
-    db["players"][s]["nickname"]    = "Player"
+    # Полный сброс — при отмене регистрации стираются АБСОЛЮТНО все данные
+    # игрока (ЭЛО, победы/поражения, K/D, платформа, дата регистрации и т.д.),
+    # а не только ник и ID. Профиль в БД удаляется целиком: если игрок
+    # зарегистрируется заново, он начнёт с чистого листа, как новый игрок.
+    del db["players"][s]
     save_db(db)
 
     await update.message.reply_text(
