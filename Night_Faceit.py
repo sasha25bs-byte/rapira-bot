@@ -3473,14 +3473,44 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer("❌ Матч уже закрыт.", show_alert=True)
             return
         await q.answer()
+
+        # ── Пересылаем все присланные по матчу скрины прямо в ЛС админу,
+        # который жмёт кнопку — чтобы фото и шаблон для заполнения были
+        # рядом друг с другом, без пролистывания истории чата. ────────────
+        shots = (
+            db.get("pending_ocr", {}).get(m_id, {}).get("screenshots")
+            or db.get("unresolved_results", {}).get(m_id, {}).get("screenshots")
+            or []
+        )
+        if shots:
+            try:
+                await context.bot.send_message(chat_id=uid, text=f"📸 Скрины по матчу #{m_id}:")
+            except Exception:
+                pass
+            for shot in shots:
+                sender = get_player(shot.get("from_uid")) if shot.get("from_uid") else None
+                caption = f"От: {sender.nickname}" if sender else None
+                try:
+                    await context.bot.forward_message(
+                        chat_id=uid,
+                        from_chat_id=shot["chat_id"],
+                        message_id=shot["message_id"],
+                    )
+                    if caption:
+                        await context.bot.send_message(chat_id=uid, text=caption)
+                except Exception as e:
+                    print(f"[wintpl] не удалось переслать скрин: {e!r}")
+
         template = _build_win_template(m_id, m, side)
+        win_label = "🔵 CT" if side == "ct" else "🔴 T"
         try:
             await context.bot.send_message(
                 chat_id=uid,
                 text=(
                     f"📋 <b>Шаблон для матча #{m_id}</b>\n"
-                    f"Впишите реальные киллы/смерти вместо нулей (можно скопировать "
-                    f"их из скрина или переписки игроков) и отправьте сообщение как есть:\n\n"
+                    f"Победила сторона: {win_label}\n\n"
+                    f"Впишите реальные киллы/смерти вместо нулей (сверьтесь со "
+                    f"скрином выше) и отправьте сообщение как есть:\n\n"
                     f"<code>{template}</code>"
                 ),
                 parse_mode=ParseMode.HTML,
@@ -3528,14 +3558,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_db(db)
         await _send_calibration_dms(context.bot, calib_notifications)
 
-        win_side_label  = "🔵 CT" if side == "ct" else "🔴 T"
-        lose_side_label = "🔴 T"  if side == "ct" else "🔵 CT"
-        text = (
-            f"🏆 <b>Матч #{m_id} [{mode.upper()}] завершён!</b> (подтверждено {q.from_user.first_name})\n\n"
-            f"✅ Победила сторона: {win_side_label}\n"
-            + ("\n".join(win_lines) if win_lines else "  (нет реальных игроков)") + "\n\n"
-            f"❌ Проиграла сторона: {lose_side_label}\n"
-            + ("\n".join(loss_lines) if loss_lines else "  (нет реальных игроков)")
+        text = _build_finished_match_card(
+            m_id, mode, side, win_lines, loss_lines, kd_by_uid, winners, losers,
+            confirmed_by=q.from_user.first_name,
         )
         try:
             await q.edit_message_text(text, parse_mode=ParseMode.HTML)
@@ -4374,6 +4399,42 @@ async def _send_calibration_dms(bot, calib_notifications: List[tuple]) -> None:
             print(f"⚠️ Не удалось отправить ЛС о калибровке uid={cal_uid}: {e!r}")
 
 
+def _build_finished_match_card(
+    m_id: str, mode: str, side: str,
+    win_lines: List[str], loss_lines: List[str],
+    kd_by_uid: Dict[int, tuple], winners: List[int], losers: List[int],
+    confirmed_by: Optional[str] = None,
+) -> str:
+    """
+    Красивая карточка завершённого матча: явный маркер победившей/проигравшей
+    стороны, суммарный счёт K/D по каждой команде и построчная разбивка по
+    игрокам. Общая для авто-подтверждения (кнопка ✅) и ручного /win —
+    чтобы результат выглядел одинаково независимо от способа ввода.
+    """
+    win_side_label  = "🔵 CT" if side == "ct" else "🔴 T"
+    lose_side_label = "🔴 T"  if side == "ct" else "🔵 CT"
+
+    def _team_kd(uids: List[int]) -> tuple:
+        tk = sum(kd_by_uid.get(u, (0, 0))[0] for u in uids if not _is_bot_uid(u))
+        td = sum(kd_by_uid.get(u, (0, 0))[1] for u in uids if not _is_bot_uid(u))
+        return tk, td
+
+    wk, wd = _team_kd(winners)
+    lk, ld = _team_kd(losers)
+
+    confirmed_line = f" <i>(подтвердил {confirmed_by})</i>" if confirmed_by else ""
+
+    return (
+        f"🏁 <b>Матч #{m_id} [{mode.upper()}] завершён!</b>{confirmed_line}\n"
+        f"━━━━━━━━━━━━━━━\n\n"
+        f"🏆 <b>Победа: {win_side_label}</b>  <code>{wk}/{wd}</code>\n"
+        + ("\n".join(win_lines) if win_lines else "  (нет реальных игроков)") + "\n\n"
+        f"💀 <b>Поражение: {lose_side_label}</b>  <code>{lk}/{ld}</code>\n"
+        + ("\n".join(loss_lines) if loss_lines else "  (нет реальных игроков)") +
+        f"\n\n━━━━━━━━━━━━━━━"
+    )
+
+
 def _finalize_match(db: Dict[str, Any], m_id: str, m: dict, side: str, kd_by_uid: Dict[int, tuple]):
     """
     Общее ядро завершения матча: начисляет результат обеим сторонам,
@@ -4850,12 +4911,16 @@ def _build_win_template(m_id: str, m: dict, side: str) -> str:
     ct_uids = [u for u in m.get("ct", []) if not _is_bot_uid(u)]
     t_uids  = [u for u in m.get("t", [])  if not _is_bot_uid(u)]
 
-    lines = [f"/win {m_id} {side}"]
-    lines.append("КТ:")
+    ct_won_mark = " 🏆" if side == "ct" else ""
+    t_won_mark  = " 🏆" if side == "t"  else ""
+
+    lines = [f"/win {m_id} {side}", ""]
+    lines.append(f"КТ:{ct_won_mark}")
     for u in ct_uids:
         p = get_player(u)
         lines.append(f"ID {p.external_id or '?'} — 0 убийств — 0 смертей. // {p.nickname}")
-    lines.append("Т:")
+    lines.append("")
+    lines.append(f"Т:{t_won_mark}")
     for u in t_uids:
         p = get_player(u)
         lines.append(f"ID {p.external_id or '?'} — 0 убийств — 0 смертей. // {p.nickname}")
@@ -4866,8 +4931,8 @@ def _build_win_template(m_id: str, m: dict, side: str) -> str:
 def _win_template_buttons(m_id: str) -> InlineKeyboardMarkup:
     """Кнопки быстрого шаблона /win под карточкой нераспознанного скрина."""
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("📋 Шаблон: победили CT", callback_data=f"wintpl_ct:{m_id}"),
-        InlineKeyboardButton("📋 Шаблон: победили T",  callback_data=f"wintpl_t:{m_id}"),
+        InlineKeyboardButton("🔵 Победили CT", callback_data=f"wintpl_ct:{m_id}"),
+        InlineKeyboardButton("🔴 Победили T",  callback_data=f"wintpl_t:{m_id}"),
     ]])
 
 
@@ -4978,6 +5043,17 @@ async def _process_result_screenshot(m_id: str, m: dict, uid: int, msg, context:
             except Exception as e:
                 print(f"[result] admin forward error: {e!r}")
 
+        # ── Запоминаем сам скрин (чат+id исходного сообщения), чтобы позже
+        # можно было переслать его любому админу, который жмёт кнопку
+        # шаблона в ЛС — не только тому, кто сидит в админ-группе. ─────────
+        prior_shots_list = (prior or {}).get("screenshots", [])
+        shots_list = list(prior_shots_list) + [{
+            "chat_id":    msg.chat_id,
+            "message_id": msg.message_id,
+            "from_uid":   uid,
+            "ts":         time.time(),
+        }]
+
         shots_count = prior_shots + 1
 
         # ── Автодоставка отсутствующих игроков ──────────────────────────
@@ -5018,6 +5094,7 @@ async def _process_result_screenshot(m_id: str, m: dict, uid: int, msg, context:
                     "kd_by_uid":          {str(k): list(v) for k, v in kd_by_uid.items()},
                     "reported_by":        uid,
                     "screenshots_count":  shots_count,
+                    "screenshots":        shots_list,
                     "filled_auto":        filled_auto,
                 }
 
@@ -5028,6 +5105,7 @@ async def _process_result_screenshot(m_id: str, m: dict, uid: int, msg, context:
                 "reported_by": uid,
                 "reasons":     reasons,
                 "ts":          time.time(),
+                "screenshots": shots_list,
             }
             save_db(db)
 
@@ -5067,6 +5145,7 @@ async def _process_result_screenshot(m_id: str, m: dict, uid: int, msg, context:
             "kd_by_uid":          {str(k): list(v) for k, v in kd_by_uid.items()},
             "reported_by":        uid,
             "screenshots_count":  shots_count,
+            "screenshots":        shots_list,
             "filled_auto":        filled_auto,
         }
         save_db(db)
@@ -5598,15 +5677,9 @@ async def win_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_calibration_dms(context.bot, calib_notifications)
     save_db(db)
 
-    win_side_label  = "🔵 CT" if side == "ct" else "🔴 T"
-    lose_side_label = "🔴 T"  if side == "ct" else "🔵 CT"
-
-    text = (
-        f"🏆 <b>Матч #{m_id} [{mode.upper()}] завершён!</b>\n\n"
-        f"✅ Победила сторона: {win_side_label}\n"
-        + ("\n".join(win_lines) if win_lines else "  (нет реальных игроков)") + "\n\n"
-        f"❌ Проиграла сторона: {lose_side_label}\n"
-        + ("\n".join(loss_lines) if loss_lines else "  (нет реальных игроков)")
+    text = _build_finished_match_card(
+        m_id, mode, side, win_lines, loss_lines, kd_by_uid, winners, losers,
+        confirmed_by=update.effective_user.first_name,
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
