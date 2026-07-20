@@ -438,6 +438,12 @@ def _make_player(d: dict) -> "Player":
     for field, default in _PLAYER_BOOL_DEFAULTS.items():
         v = clean.get(field, default)
         clean[field] = v if isinstance(v, bool) else default
+    # Финальная защита: некоторые дефолтные словари (например
+    # _PLAYER_STRING_DEFAULTS) могут содержать поля, которых нет в самом
+    # датаклассе Player (например "platform" — он хранится в БД у игрока,
+    # но не является атрибутом Player). Без этой фильтрации Player(**clean)
+    # падает с "unexpected keyword argument". Оставляем только известные поля.
+    clean = {k: v for k, v in clean.items() if k in known}
     return Player(**clean)
 
 
