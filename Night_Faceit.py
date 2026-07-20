@@ -226,6 +226,7 @@ class Player:
     total_kills:   int   = 0
     total_deaths:  int   = 0
     registered_ts: float = 0.0    # unix-время реальной регистрации (0 = неизвестно, старая запись)
+    platform:      str   = "pc"   # "pc" или "mobile" — платформа игрока (влияет на начисление ELO)
 
     def lvl_icon(self) -> str:
         if not self.is_calibrated:
