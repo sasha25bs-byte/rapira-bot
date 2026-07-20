@@ -4398,8 +4398,42 @@ def _finalize_match(db: Dict[str, Any], m_id: str, m: dict, side: str, kd_by_uid
 # результат. Если бот вообще не смог уверенно распознать таблицу — он прямо
 # так и скажет, и попросит ввести /win руками, как раньше.
 
+_OCR_RUS_LANG_CHECKED = False
+_OCR_RUS_LANG_OK = False
+
+
 def _ocr_available() -> bool:
-    return pytesseract is not None
+    """
+    True только если И pytesseract подключён, И у tesseract реально
+    установлен русский языковой пакет (tesseract-ocr-rus). Без него
+    lang="rus+eng" НЕ падает с ошибкой — Tesseract просто распознаёт
+    кириллицу как случайную латиницу/мусор ("ПОБЕДА" → "MOBEA «"), и весь
+    скрипт ниже молча не находит ни одного заголовка таблицы. Это самая
+    частая причина, почему бот пишет "не нашёл таблицу на скрине" на
+    абсолютно нормальных, чётких скриншотах — поэтому проверяем языковой
+    пакет явно один раз при первом обращении и кэшируем результат.
+    """
+    global _OCR_RUS_LANG_CHECKED, _OCR_RUS_LANG_OK
+    if pytesseract is None:
+        return False
+    if _OCR_RUS_LANG_CHECKED:
+        return _OCR_RUS_LANG_OK
+    _OCR_RUS_LANG_CHECKED = True
+    try:
+        langs = pytesseract.get_languages(config="")
+        _OCR_RUS_LANG_OK = "rus" in langs
+        if not _OCR_RUS_LANG_OK:
+            print(
+                "[ocr] ⚠️ ВНИМАНИЕ: языковой пакет 'rus' НЕ установлен в tesseract "
+                f"(доступны только: {langs}). Распознавание русских скриншотов "
+                "работать НЕ будет — Tesseract читает кириллицу как мусор без "
+                "явной ошибки. Добавь 'tesseract-ocr-rus' в Aptfile проекта на "
+                "Railway и передеплой."
+            )
+    except Exception as e:
+        print(f"[ocr] не удалось проверить список языков tesseract: {e!r}")
+        _OCR_RUS_LANG_OK = False
+    return _OCR_RUS_LANG_OK
 
 
 def parse_scoreboard_ocr(image_bytes: bytes) -> Optional[dict]:
@@ -4896,7 +4930,10 @@ async def _process_result_screenshot(m_id: str, m: dict, uid: int, msg, context:
         if not ocr_ok:
             reasons = []
             if not _ocr_available():
-                reasons.append("на сервере не настроен OCR (tesseract не найден — проверь Aptfile/requirements.txt на Railway)")
+                if pytesseract is None:
+                    reasons.append("на сервере не установлен pytesseract/tesseract (проверь requirements.txt и Aptfile на Railway)")
+                else:
+                    reasons.append("на сервере не установлен русский языковой пакет tesseract-ocr-rus (добавь его в Aptfile и передеплой)")
             elif not ocr_result and not prior:
                 reasons.append("не нашёл таблицу на скрине (плохой ракурс/качество/не тот интерфейс)")
             else:
