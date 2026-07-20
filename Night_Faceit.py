@@ -105,7 +105,16 @@ else:
 SEASON_NAME     = "Test Season"
 SEASON_END      = "20.07.2026"
 
-MAPS_LIST      = ["Dust 2"]
+MAPS_LIST      = ["Dust 2", "Mirage"]
+
+# 🚫 Временно отключаем пик/бан карт — рандомный выбор карты капитанами-ботами
+# (или по таймауту) не устраивает, пока нет ручного выбора карты игроками.
+# Пока флаг False: фаза "бан карт" никогда не запускается, матч всегда играется
+# на ПЕРВОЙ карте из MAPS_LIST (сейчас — Dust 2), даже если карт в списке больше
+# одной. Как только сделаете нормальный выбор карты — поставьте True, вся
+# существующая логика бана карт заработает как раньше без дополнительных правок.
+MAP_PICK_ENABLED = False
+
 LOBBY_5V5_SIZE = 10
 LOBBY_2V2_SIZE = 4
 PICK_TIMEOUT   = 90
@@ -833,7 +842,7 @@ async def _bot_auto_pick(m_id: str, context: ContextTypes.DEFAULT_TYPE, chat_id:
             except Exception:
                 pass
 
-            if len(m["maps"]) > 1:
+            if MAP_PICK_ENABLED and len(m["maps"]) > 1:
                 # Карт больше одной — начинаем бан карт. Первым банит CT-капитан.
                 m["phase"] = "ban"
                 m["turn"] = ct_cap
@@ -1242,7 +1251,7 @@ async def start_match(players: List[int], mode: str, db: Dict,
 
     map_line = (
         f"🗺 Карта: <b>{MAPS_LIST[0]}</b>\n\n"
-        if len(MAPS_LIST) == 1 else
+        if not MAP_PICK_ENABLED or len(MAPS_LIST) == 1 else
         f"🗺 Карты в пуле: <b>{', '.join(MAPS_LIST)}</b> (после пика — бан карт)\n\n"
     )
     txt = (
@@ -1315,6 +1324,7 @@ def main_menu_kb(uid: int, reg: bool) -> InlineKeyboardMarkup:
     ])
     if is_moderator(uid):
         keyboard.append([InlineKeyboardButton("🌙 Команда Faceit", callback_data="cmd_admins")])
+    if is_creator(uid):
         keyboard.append([InlineKeyboardButton("🛠 Админ-панель", callback_data="ap_open")])
     return InlineKeyboardMarkup(keyboard)
 
@@ -4029,7 +4039,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id_for_banner = m.get("chat_id", q.message.chat_id)
             thread_id_for_banner = m.get("thread_id")
 
-            if len(m["maps"]) > 1:
+            if MAP_PICK_ENABLED and len(m["maps"]) > 1:
                 # Карт больше одной — начинаем бан карт. Первым банит CT-капитан.
                 m["phase"] = "ban"
                 m["turn"] = ct_cap
@@ -4759,7 +4769,7 @@ async def unban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ════════════════════════════════════════════════
-#         АДМИН-ПАНЕЛЬ (только в ЛС, кнопками)
+#    АДМИН-ПАНЕЛЬ (только в ЛС, кнопками, только владелец/создатель)
 # ════════════════════════════════════════════════
 # Пошаговый визард выдачи/снятия наказаний по ID или никнейму игрока.
 # Каждый шаг — редактирование ОДНОГО и того же сообщения бота, а
@@ -4852,7 +4862,7 @@ async def ap_dm_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     uid = update.effective_user.id
     st  = context.user_data.get("ap")
-    if not st or not is_moderator(uid):
+    if not st or not is_creator(uid):
         return
 
     step    = st.get("step")
@@ -4971,9 +4981,11 @@ async def ap_dm_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def _ap_callback(q, context: ContextTypes.DEFAULT_TYPE, cb: str) -> None:
-    """Обрабатывает все callback_data с префиксом ap_ (кнопки админ-панели)."""
+    """Обрабатывает все callback_data с префиксом ap_ (кнопки админ-панели).
+    Доступно ТОЛЬКО создателю — остальные админы/модеры продолжают
+    пользоваться обычными командами (/ban, /mute, /win и т.д.)."""
     uid = q.from_user.id
-    if not is_moderator(uid):
+    if not is_creator(uid):
         await q.answer("⛔ Недоступно.", show_alert=True)
         return
     await q.answer()
