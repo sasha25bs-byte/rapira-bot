@@ -3460,6 +3460,35 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer("🔇 Вы в муте — любые действия запрещены!", show_alert=True)
             return
 
+    # ── АДМИН/МОД: БЫСТРЫЙ ШАБЛОН /win С ПОДСТАВЛЕННЫМИ ID ────────────────────
+    if cb.startswith("wintpl_ct:") or cb.startswith("wintpl_t:"):
+        if not is_moderator(uid):
+            await q.answer("❌ Недостаточно прав.", show_alert=True)
+            return
+        side = "ct" if cb.startswith("wintpl_ct:") else "t"
+        m_id = cb.split(":", 1)[1]
+        db = load_db()
+        m = db.get("active_matches", {}).get(m_id)
+        if not m:
+            await q.answer("❌ Матч уже закрыт.", show_alert=True)
+            return
+        await q.answer()
+        template = _build_win_template(m_id, m, side)
+        try:
+            await context.bot.send_message(
+                chat_id=uid,
+                text=(
+                    f"📋 <b>Шаблон для матча #{m_id}</b>\n"
+                    f"Впишите реальные киллы/смерти вместо нулей (можно скопировать "
+                    f"их из скрина или переписки игроков) и отправьте сообщение как есть:\n\n"
+                    f"<code>{template}</code>"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        return
+
     # ── ПОДТВЕРЖДЕНИЕ РАСПОЗНАННОГО РЕЗУЛЬТАТА МАТЧА (OCR) ────────────────────
     if cb.startswith("ocrwin_confirm:") or cb.startswith("ocrwin_manual:"):
         if not is_moderator(uid):
@@ -3597,10 +3626,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"📸 <b>Матч #{m_id}</b> — прислан скрин, но бот <u>не смог распознать</u> результат.\n"
                 + (f"Причина: {'; '.join(reasons)}\n" if reasons else "") +
                 (f"\nОт: {reporter.tg_link()}" if reporter else "") +
-                f"\n\nВведите результат вручную:\n<code>/win {m_id} ct|t ...</code>"
+                f"\n\nНажмите кнопку — получите готовый шаблон /win с подставленными ID."
             )
             try:
-                await context.bot.send_message(chat_id=uid, text=text, parse_mode=ParseMode.HTML)
+                await context.bot.send_message(
+                    chat_id=uid, text=text, parse_mode=ParseMode.HTML,
+                    reply_markup=_win_template_buttons(m_id),
+                )
                 sent_any = True
             except Exception:
                 pass
@@ -4806,6 +4838,39 @@ def _fill_missing_players_as_losers(m: dict, kd_by_uid: Dict[int, tuple], side_w
     return filled
 
 
+def _build_win_template(m_id: str, m: dict, side: str) -> str:
+    """
+    Строит готовый шаблон команды /win для матча m_id с уже подставленными
+    game ID и никами всех игроков — админу остаётся только вписать реальные
+    цифры убийств/смертей вместо нулей и отправить сообщение как есть.
+    Это не заменяет OCR, а даёт быстрый путь ручного ввода: не нужно
+    вспоминать/искать game ID каждого игрока и печатать структуру команды
+    с нуля — только скопировать шаблон и подправить числа.
+    """
+    ct_uids = [u for u in m.get("ct", []) if not _is_bot_uid(u)]
+    t_uids  = [u for u in m.get("t", [])  if not _is_bot_uid(u)]
+
+    lines = [f"/win {m_id} {side}"]
+    lines.append("КТ:")
+    for u in ct_uids:
+        p = get_player(u)
+        lines.append(f"ID {p.external_id or '?'} — 0 убийств — 0 смертей. // {p.nickname}")
+    lines.append("Т:")
+    for u in t_uids:
+        p = get_player(u)
+        lines.append(f"ID {p.external_id or '?'} — 0 убийств — 0 смертей. // {p.nickname}")
+
+    return "\n".join(lines)
+
+
+def _win_template_buttons(m_id: str) -> InlineKeyboardMarkup:
+    """Кнопки быстрого шаблона /win под карточкой нераспознанного скрина."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("📋 Шаблон: победили CT", callback_data=f"wintpl_ct:{m_id}"),
+        InlineKeyboardButton("📋 Шаблон: победили T",  callback_data=f"wintpl_t:{m_id}"),
+    ]])
+
+
 def _build_ocr_confirm_card(m_id: str, m: dict, pending: dict) -> tuple:
     """
     Строит (текст, клавиатура) карточки подтверждения распознанного
@@ -4983,10 +5048,13 @@ async def _process_result_screenshot(m_id: str, m: dict, uid: int, msg, context:
                         f"⚠️ Бот не смог уверенно распознать результат автоматически "
                         f"({'; '.join(reasons) if reasons else 'неизвестная причина'})."
                         f"{progress_line}\n"
-                        f"Проверьте вручную и введите <code>/win {m_id} ct|t ...</code>, "
-                        f"либо дождитесь ещё одного скрина от другого игрока матча."
+                        f"Нажмите кнопку ниже, чтобы получить готовый шаблон ввода с "
+                        f"подставленными ID игроков — останется вписать только цифры "
+                        f"убийств/смертей, либо дождитесь ещё одного скрина от другого "
+                        f"игрока матча."
                     ),
                     parse_mode=ParseMode.HTML,
+                    reply_markup=_win_template_buttons(m_id),
                 )
             return
 
