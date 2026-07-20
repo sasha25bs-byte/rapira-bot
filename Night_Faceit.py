@@ -1116,8 +1116,12 @@ async def _announce_lobby_ready(
                 chat_id=member_uid,
                 text=(
                     f"🎮 <b>Матч #{m_id} собран!</b>\n\n"
-                    f"Сторона: {side_tag}\n"
-                    f"🗺 Карта: <b>{final_map}</b>\n\n"
+                    f"Твоя сторона: {side_tag}\n"
+                    f"🗺 Карта: <b>{final_map}</b>\n"
+                    f"{banned_line}"
+                    f"\n🔵 <b>CT:</b>\n{ct_list}\n\n"
+                    f"🔴 <b>T:</b>\n{t_list}\n\n"
+                    f"🖥 Хост лобби: {host_p.tg_link()} ({host_side})\n\n"
                     f"Когда катка закончится — нажми кнопку ниже и пришли "
                     f"скриншот результата прямо в этот чат."
                 ),
@@ -4400,25 +4404,41 @@ def _ocr_available() -> bool:
 
 def parse_scoreboard_ocr(image_bytes: bytes) -> Optional[dict]:
     """
-    Пытается разобрать скриншот финального скорборда.
+    Пытается разобрать скриншот результата матча. Игроки присылают ОДИН из
+    двух разных экранов игры, и оба нужно понимать одинаково хорошо:
+
+      Формат A — "в игре" (freeze-frame HUD после раунда/матча):
+        колонки подписаны полными словами "УБИЙСТВ" / "СМЕРТЕЙ", сверху есть
+        HUD-счёт команд (два числа рядом с таймером), и/или зелёный баннер
+        "ПОБЕДА"/"ПОРАЖЕНИЕ" поверх части строк. Игровой ID стоит СПРАВА от
+        ника (номер после имени).
+
+      Формат B — финальный экран "В МЕНЮ" (табло по окончании матча):
+        две колонки-таблицы бок о бок (Спецназ | Террористы), у каждой свои
+        заголовки "У" (убийств) и "С" (смертей) вместо полных слов, общий
+        счёт указан один раз сверху по центру каждой половины экрана
+        ("СПЕЦНАЗ ... <b>8</b> | <b>6</b> ... ТЕРРОРИСТЫ"). Игровой ID тоже
+        справа от ника.
 
     Алгоритм:
-      1) Прогоняем всё изображение через Tesseract (рус+eng), получаем слова
-         с координатами.
-      2) Находим заголовки колонок "УБИЙСТВ" / "СМЕРТЕЙ" — это даёт X-координаты
-         колонок независимо от разрешения скрина.
-      3) Группируем найденные числа в строки по Y-координате (одна строка
-         игрока = одна визуальная линия таблицы).
-      4) В каждой строке: число под колонкой "УБИЙСТВ" → киллы, под "СМЕРТЕЙ" →
-         смерти, число левее (в стороне ника) → игровой ID, текст левее ID → ник.
+      1) Прогоняем изображение через Tesseract (рус+eng) → слова с координатами.
+      2) Пытаемся найти заголовки полными словами (формат A). Если не нашли —
+         ищем короткие заголовки "У"/"С" рядом друг с другом дважды (по разу
+         на каждую половину экрана формата B) и работаем с двумя независимыми
+         наборами колонок вместо одного.
+      3) Группируем найденные числа в строки по Y-координате.
+      4) В каждой строке: под "У"-колонкой → киллы, под "С"-колонкой → смерти,
+         число СПРАВА от ника (или слева, если справа не нашли) → игровой ID.
       5) Цвет пикселя рядом с ником (синий/оранжевый) определяет команду —
-         так же различаются строки на самом скрине.
-      6) Два числа над таблицей, по центру экрана — счёт команд; сторона
-         с большим числом — победитель.
+         подстраховка на случай формата B, где команды и так разнесены по
+         половинам экрана.
+      6) Счёт команд: либо два числа над таблицей по центру (формат A), либо
+         два числа в шапке "СПЕЦНАЗ X | Y ТЕРРОРИСТЫ" (формат B). Сторона с
+         большим числом — победитель. Плюс запасной сигнал — баннер "ПОБЕДА".
 
-    Возвращает None, если не удалось найти таблицу вообще (нет заголовков)
-    или строк меньше двух — тогда вызывающий код должен откатиться на ручной
-    ввод через /win.
+    Возвращает None, если не удалось найти вообще ни одной таблицы (нет
+    заголовков) или строк меньше одной — тогда вызывающий код должен
+    откатиться на ручной ввод через /win.
     """
     if not _ocr_available():
         return None
@@ -4451,83 +4471,148 @@ def parse_scoreboard_ocr(image_bytes: bytes) -> Optional[dict]:
             "w": data["width"][i], "h": data["height"][i],
         })
 
-    kills_x = deaths_x = header_y = None
-    for wd in words:
-        t = wd["text"].upper()
-        if "УБИЙСТ" in t and kills_x is None:
-            kills_x = wd["x"] + wd["w"] // 2
-            header_y = wd["y"]
-        elif "СМЕРТ" in t and deaths_x is None:
-            deaths_x = wd["x"] + wd["w"] // 2
-            header_y = wd["y"] if header_y is None else min(header_y, wd["y"])
+    # ── Ищем колонки-заголовки. Может быть НЕСКОЛЬКО пар (формат B — по
+    # паре на каждую половину экрана), поэтому всегда собираем список пар,
+    # а не одну пару, как раньше. ────────────────────────────────────────
+    col_pairs: List[dict] = []  # [{"kills_x":.., "deaths_x":.., "header_y":..}]
 
-    if kills_x is None or deaths_x is None:
-        return None  # не нашли шапку таблицы — не похоже на наш скорборд
+    # Формат A: полные слова "УБИЙСТВ" / "СМЕРТЕЙ" — обычно ровно одна пара
+    # на весь экран (общая таблица на двоих).
+    full_kills = [wd for wd in words if "УБИЙСТ" in wd["text"].upper()]
+    full_deaths = [wd for wd in words if "СМЕРТ" in wd["text"].upper()]
+    if full_kills and full_deaths:
+        kw = full_kills[0]
+        dw = min(full_deaths, key=lambda wd: abs(wd["y"] - kw["y"]))
+        col_pairs.append({
+            "kills_x":  kw["x"] + kw["w"] // 2,
+            "deaths_x": dw["x"] + dw["w"] // 2,
+            "header_y": min(kw["y"], dw["y"]),
+        })
+
+    # Формат B: короткие одиночные заголовки "У" и "С" — на каждой половине
+    # экрана своя пара, соседствующая по Y и с "С" правее "У".
+    if not col_pairs:
+        short_u = [wd for wd in words if wd["text"].upper() in ("У", "K", "K/", "УБ") and wd["w"] < w * 0.06]
+        short_s = [wd for wd in words if wd["text"].upper() in ("С", "D", "СМ") and wd["w"] < w * 0.06]
+        for uw in short_u:
+            # Ищем "С" на той же строке (близкий Y) и правее по X.
+            same_row = [
+                swd for swd in short_s
+                if abs(swd["y"] - uw["y"]) < max(10, uw["h"])
+                and swd["x"] > uw["x"]
+            ]
+            if not same_row:
+                continue
+            sw = min(same_row, key=lambda wd: wd["x"] - uw["x"])
+            col_pairs.append({
+                "kills_x":  uw["x"] + uw["w"] // 2,
+                "deaths_x": sw["x"] + sw["w"] // 2,
+                "header_y": min(uw["y"], sw["y"]),
+            })
+
+    if not col_pairs:
+        return None  # не нашли ни одной шапки таблицы — не похоже на наш скорборд
 
     col_tol = max(45, w // 18)
     row_tol = max(16, h // 55)
 
-    number_words = [wd for wd in words if wd["text"].isdigit() and wd["y"] > header_y]
+    rows: List[dict] = []
+    for pair in col_pairs:
+        kills_x, deaths_x, header_y = pair["kills_x"], pair["deaths_x"], pair["header_y"]
 
-    rows_y: List[int] = []
-    for wd in sorted(number_words, key=lambda x: x["y"]):
-        if not any(abs(wd["y"] - ry) < row_tol for ry in rows_y):
-            rows_y.append(wd["y"])
+        number_words = [wd for wd in words if wd["text"].isdigit() and wd["y"] > header_y]
 
-    rows = []
-    for ry in rows_y:
-        row_nums = [wd for wd in number_words if abs(wd["y"] - ry) < row_tol]
+        rows_y: List[int] = []
+        for wd in sorted(number_words, key=lambda x: x["y"]):
+            if not any(abs(wd["y"] - ry) < row_tol for ry in rows_y):
+                rows_y.append(wd["y"])
 
-        def _closest(target_x):
-            cands = [wd for wd in row_nums if abs(wd["x"] - target_x) < col_tol]
-            return min(cands, key=lambda wd: abs(wd["x"] - target_x)) if cands else None
+        for ry in rows_y:
+            row_nums = [wd for wd in number_words if abs(wd["y"] - ry) < row_tol]
 
-        kills_cell  = _closest(kills_x)
-        deaths_cell = _closest(deaths_x)
-        if not kills_cell or not deaths_cell or kills_cell is deaths_cell:
+            def _closest(target_x, exclude=()):
+                cands = [wd for wd in row_nums if abs(wd["x"] - target_x) < col_tol and wd not in exclude]
+                return min(cands, key=lambda wd: abs(wd["x"] - target_x)) if cands else None
+
+            kills_cell  = _closest(kills_x)
+            deaths_cell = _closest(deaths_x, exclude=[kills_cell] if kills_cell else [])
+            if not kills_cell or not deaths_cell or kills_cell is deaths_cell:
+                continue
+
+            # Игровой ID — число в этой же строке, НЕ являющееся киллами/смертями.
+            # Ищем СНАЧАЛА справа от ника (форматы A и B кладут ID сразу после
+            # ника), затем слева — на случай другой раскладки экрана.
+            id_candidates = [
+                wd for wd in row_nums
+                if wd is not kills_cell and wd is not deaths_cell
+            ]
+            if not id_candidates:
+                continue
+            # ID — самое левое число из тех, что расположены заметно левее
+            # колонки "убийств" (т.е. явно не часть статы, а подпись у ника).
+            id_pool = [wd for wd in id_candidates if wd["x"] < kills_x - col_tol]
+            if not id_pool:
+                continue
+            id_cell = min(id_pool, key=lambda wd: wd["x"])
+
+            # Ник — весь нечисловой текст в строке. Может быть как слева от
+            # ID (формат A: "Ник ID"), так и всё равно слева (формат B тоже
+            # кладёт ник первым, потом ID) — в обоих случаях берём слова
+            # левее ID-ячейки.
+            nick_words = [
+                wd for wd in words
+                if not wd["text"].isdigit()
+                and abs(wd["y"] - ry) < row_tol
+                and wd["x"] < id_cell["x"] - 5
+                and wd["x"] < kills_x
+            ]
+            nick_words.sort(key=lambda wd: wd["x"])
+            nickname = " ".join(wd["text"] for wd in nick_words) if nick_words else None
+            if not nickname:
+                continue
+
+            sample_x = max(0, min(w - 1, nick_words[0]["x"] + 5))
+            sample_y = max(0, min(h - 1, ry + max(4, nick_words[0]["h"] // 2)))
+            try:
+                r, g, b = img.getpixel((sample_x, sample_y))[:3]
+            except Exception:
+                r, g, b = (0, 0, 0)
+            # Доп. сигнал команды: какая половина экрана (актуально для
+            # формата B, где команды физически разнесены влево/вправо).
+            side_hint = "left" if (kills_x < w / 2) else "right"
+            team = "blue" if b > r + 12 else ("orange" if r > b + 12 else "unknown")
+
+            rows.append({
+                "external_id": id_cell["text"],
+                "nickname":    nickname,
+                "kills":       int(kills_cell["text"]),
+                "deaths":      int(deaths_cell["text"]),
+                "team":        team,
+                "side_hint":   side_hint,
+            })
+
+    # Дедупликация — если формат A и B случайно дали пересекающиеся строки
+    # (не должно происходить, т.к. col_pairs формируются взаимоисключающе,
+    # но на всякий случай подстраховываемся по external_id).
+    seen_ids = set()
+    dedup_rows = []
+    for row in rows:
+        if row["external_id"] in seen_ids:
             continue
+        seen_ids.add(row["external_id"])
+        dedup_rows.append(row)
+    rows = dedup_rows
 
-        id_candidates = [
-            wd for wd in row_nums
-            if wd is not kills_cell and wd is not deaths_cell and wd["x"] < kills_x - col_tol
-        ]
-        if not id_candidates:
-            continue
-        id_cell = max(id_candidates, key=lambda wd: wd["x"])
-
-        nick_words = [
-            wd for wd in words
-            if not wd["text"].isdigit()
-            and abs(wd["y"] - ry) < row_tol
-            and wd["x"] < id_cell["x"] - 5
-        ]
-        nick_words.sort(key=lambda wd: wd["x"])
-        nickname = " ".join(wd["text"] for wd in nick_words) if nick_words else None
-        if not nickname:
-            continue
-
-        sample_x = max(0, min(w - 1, nick_words[0]["x"] + 5))
-        sample_y = max(0, min(h - 1, ry + max(4, nick_words[0]["h"] // 2)))
-        try:
-            r, g, b = img.getpixel((sample_x, sample_y))[:3]
-        except Exception:
-            r, g, b = (0, 0, 0)
-        team = "blue" if b > r + 12 else ("orange" if r > b + 12 else "unknown")
-
-        rows.append({
-            "external_id": id_cell["text"],
-            "nickname":    nickname,
-            "kills":       int(kills_cell["text"]),
-            "deaths":      int(deaths_cell["text"]),
-            "team":        team,
-        })
-
-    if len(rows) < 2:
+    if len(rows) < 1:
         return None
 
+    header_y_min = min(p["header_y"] for p in col_pairs)
+
+    # ── Счёт команд, вариант 1: два числа над таблицей по центру экрана
+    # (формат A — HUD-счёт рядом с таймером). ────────────────────────────
     score_candidates = [
         wd for wd in words
-        if wd["text"].isdigit() and wd["y"] < header_y and len(wd["text"]) <= 2
+        if wd["text"].isdigit() and wd["y"] < header_y_min and len(wd["text"]) <= 2
         and w * 0.30 < wd["x"] < w * 0.70
     ]
     score_candidates.sort(key=lambda wd: wd["x"])
@@ -4539,11 +4624,32 @@ def parse_scoreboard_ocr(image_bytes: bytes) -> Optional[dict]:
         except ValueError:
             blue_score = orange_score = None
 
+    # ── Счёт команд, вариант 2: формат B кладёт счёт как отдельные числа
+    # слева и справа от заголовка результата ("СПЕЦНАЗ  8   6  ТЕРРОРИСТЫ"),
+    # выше всех колонок-заголовков "У"/"С". Берём два "крупных" одиночных
+    # числа выше header_y_min, ближе к горизонтальному центру, но шире зоны
+    # варианта 1 (т.к. на широких экранах счёт может быть не строго по
+    # центру половины таблицы). ──────────────────────────────────────────
+    if blue_score is None or orange_score is None:
+        top_numbers = [
+            wd for wd in words
+            if wd["text"].isdigit() and wd["y"] < header_y_min and len(wd["text"]) <= 2
+        ]
+        top_numbers.sort(key=lambda wd: wd["x"])
+        if len(top_numbers) >= 2:
+            left_half  = [wd for wd in top_numbers if wd["x"] < w / 2]
+            right_half = [wd for wd in top_numbers if wd["x"] >= w / 2]
+            if left_half and right_half:
+                try:
+                    blue_score   = int(max(left_half,  key=lambda wd: wd["x"])["text"])
+                    orange_score = int(min(right_half, key=lambda wd: wd["x"])["text"])
+                except ValueError:
+                    blue_score = orange_score = None
+
     # ── Запасной сигнал: баннер "ПОБЕДА"/"ПОРАЖЕНИЕ" ────────────────────
-    # На некоторых экранах (freeze-frame конца раунда/матча) числовой счёт
-    # закрыт этим баннером. Слово само по себе не говорит, ЧЬЯ это победа —
-    # это интерпретируется в _match_ocr_to_roster относительно того, кто
-    # прислал скриншот (он точно один из игроков этого матча).
+    # Слово само по себе не говорит, ЧЬЯ это победа — это интерпретируется
+    # в _match_ocr_to_roster относительно того, кто прислал скриншот (он
+    # точно один из игроков этого матча).
     result_word = None
     for wd in words:
         t = wd["text"].upper()
@@ -4562,15 +4668,25 @@ def parse_scoreboard_ocr(image_bytes: bytes) -> Optional[dict]:
     }
 
 
-def _match_ocr_to_roster(m: dict, ocr: dict, reporter_uid: Optional[int] = None) -> tuple:
+def _match_ocr_to_roster(m: dict, ocr: dict, reporter_uid: Optional[int] = None,
+                          prior_kd_by_uid: Optional[Dict[int, tuple]] = None,
+                          prior_side_win: Optional[str] = None) -> tuple:
     """
     Сопоставляет распознанные строки (по external_id) с реальными игроками
     матча m (ct/t списки uid). Возвращает (kd_by_uid, side_win, unmatched, missing).
-      kd_by_uid  — {uid: (kills, deaths)} для всех сматченных игроков
-      side_win   — "ct"/"t"/None (None — не смогли определить победителя)
+      kd_by_uid  — {uid: (kills, deaths)} — НАКОПЛЕННЫЙ результат: если матчу
+                   уже присылали скрин раньше (prior_kd_by_uid), новые строки
+                   ДОПОЛНЯЮТ его, а не затирают целиком. Это нужно потому что
+                   разные игроки часто шлют разные скрины (каждый видит крупно
+                   свою половину экрана) — из них двух вместе может получиться
+                   полный ростер, даже если ни один скрин по отдельности не
+                   содержал всех.
+      side_win   — "ct"/"t"/None (None — не смогли определить победителя).
+                   Если новый скрин не даёт счёта, используется prior_side_win.
       unmatched  — распознанные строки, чей external_id не принадлежит ни одному
                    игроку этого матча (мусор/OCR-ошибка)
-      missing    — реальные игроки матча, для которых бот не нашёл строку
+      missing    — реальные игроки матча, для которых ДО СИХ ПОР нет строки
+                   ни на одном присланном скрине
     """
     all_uids = [u for u in (m.get("ct", []) + m.get("t", [])) if not _is_bot_uid(u)]
     ext_to_uid = {}
@@ -4579,9 +4695,9 @@ def _match_ocr_to_roster(m: dict, ocr: dict, reporter_uid: Optional[int] = None)
         if p.external_id:
             ext_to_uid[str(p.external_id)] = uid
 
-    kd_by_uid: Dict[int, tuple] = {}
+    kd_by_uid: Dict[int, tuple] = dict(prior_kd_by_uid or {})
     unmatched: List[str] = []
-    matched_uids = set()
+    matched_uids = set(kd_by_uid.keys())
     row_team_of_uid: Dict[int, str] = {}
 
     for row in ocr["rows"]:
@@ -4622,7 +4738,38 @@ def _match_ocr_to_roster(m: dict, ocr: dict, reporter_uid: Optional[int] = None)
                 ct_hits = sum(1 for u in color_uids if u in ct_set)
                 side_win = "ct" if ct_hits >= len(color_uids) / 2 else "t"
 
+    if side_win is None:
+        side_win = prior_side_win
+
     return kd_by_uid, side_win, unmatched, missing
+
+
+def _fill_missing_players_as_losers(m: dict, kd_by_uid: Dict[int, tuple], side_win: Optional[str]) -> List[str]:
+    """
+    Для игроков матча, которых бот НИ РАЗУ не нашёл ни на одном присланном
+    скрине (не зашёл в катку, вылетел, скрин не поймал его строку и т.п.) —
+    автоматически проставляет им 0 убийств / 8 смертей и засчитывает их в
+    ПРОИГРАВШУЮ сторону. Это соответствует логике «отсутствие результата —
+    это не сыгранный раунд», а не техническая победа отсутствующего игрока.
+    Возвращает список ников, которых пришлось доставить таким образом
+    (используется в тексте карточки подтверждения, чтобы админ это видел).
+    """
+    if side_win not in ("ct", "t"):
+        return []
+    losing_side = "t" if side_win == "ct" else "ct"
+    losing_uids = [u for u in m.get(losing_side, []) if not _is_bot_uid(u)]
+
+    filled: List[str] = []
+    for uid in losing_uids:
+        if uid not in kd_by_uid:
+            kd_by_uid[uid] = (0, 8)
+            filled.append(get_player(uid).nickname)
+
+    # Игроков победившей стороны без строки НЕ автозаполняем нулём — если
+    # команда выиграла, но бот не нашёл кого-то из победителей на скринах,
+    # это обычно ошибка распознавания ника/ID, а не реальный 0/0 победителя.
+    # Такие случаи остаются в missing и уходят на ручную проверку админом.
+    return filled
 
 
 def _build_ocr_confirm_card(m_id: str, m: dict, pending: dict) -> tuple:
@@ -4634,22 +4781,29 @@ def _build_ocr_confirm_card(m_id: str, m: dict, pending: dict) -> tuple:
     side_win = pending["side"]
     kd_by_uid = {int(k): tuple(v) for k, v in pending["kd_by_uid"].items()}
     reporter_uid = pending.get("reported_by")
+    filled_auto = set(pending.get("filled_auto", []))
 
     win_label = "🔵 CT" if side_win == "ct" else "🔴 T"
     lines = []
     for u, (k, d) in kd_by_uid.items():
         pl = get_player(u)
         side_tag = "🏆" if (u in m.get(side_win, [])) else "❌"
-        lines.append(f"  {side_tag} {pl.nickname}: {k}/{d}")
+        auto_tag = " ⚠️<i>(не найден на скрине — авто 0/8)</i>" if pl.nickname in filled_auto else ""
+        lines.append(f"  {side_tag} {pl.nickname}: {k}/{d}{auto_tag}")
 
     reporter_line = ""
     if reporter_uid:
         reporter_line = f"\n\nОт: {get_player(reporter_uid).tg_link()}"
 
+    screenshots_line = ""
+    n_shots = pending.get("screenshots_count", 1)
+    if n_shots > 1:
+        screenshots_line = f"\n📸 Собрано из {n_shots} присланных скринов."
+
     text = (
         f"🤖 <b>Матч #{m_id}</b> — распознанный результат по скрину:\n\n"
         f"Победила сторона: {win_label}\n" + "\n".join(lines) +
-        reporter_line +
+        reporter_line + screenshots_line +
         f"\n\nПроверьте и подтвердите, либо введите вручную через /win."
     )
     kb = InlineKeyboardMarkup([[
@@ -4667,20 +4821,50 @@ async def _process_result_screenshot(m_id: str, m: dict, uid: int, msg, context:
     Используется и при скрине в группе (по подписи с номером матча),
     и при скрине, присланном игроком в ЛС боту.
     НЕ отвечает игроку — это делает вызывающий код (там разный текст).
+
+    Игроки часто присылают РАЗНЫЕ скрины одного и того же матча (в игре
+    видно крупно только свою половину экрана, а после матча — общий
+    финальный экран), поэтому результат НАКАПЛИВАЕТСЯ: если по матчу уже
+    приходил скрин раньше — новые распознанные строки достраивают прошлый
+    результат, а не затирают его. Как только сторона-победитель известна
+    (из счёта или баннера «ПОБЕДА»/«ПОРАЖЕНИЕ» на любом из скринов), а
+    кого-то из проигравшей стороны так и не нашли ни на одном скрине —
+    бот сам проставляет ему 0 убийств / 8 смертей, чтобы не блокировать
+    подтверждение результата из-за одного не зашедшего в катку игрока.
     """
     p = get_player(uid)
     try:
         ocr_result = None
-        kd_by_uid: Dict[int, tuple] = {}
-        side_win = None
         unmatched: List[str] = []
         missing: List[str] = []
+
+        prior = db.get("pending_ocr", {}).get(m_id)
+        prior_kd_by_uid: Dict[int, tuple] = {}
+        prior_side_win: Optional[str] = None
+        prior_shots = 0
+        if prior:
+            prior_kd_by_uid = {int(k): tuple(v) for k, v in prior.get("kd_by_uid", {}).items()}
+            prior_side_win  = prior.get("side")
+            prior_shots     = prior.get("screenshots_count", 1)
+
+        kd_by_uid: Dict[int, tuple] = dict(prior_kd_by_uid)
+        side_win = prior_side_win
+
         try:
             photo_file = await msg.photo[-1].get_file()
             photo_bytes = bytes(await photo_file.download_as_bytearray())
             ocr_result = parse_scoreboard_ocr(photo_bytes)
             if ocr_result:
-                kd_by_uid, side_win, unmatched, missing = _match_ocr_to_roster(m, ocr_result, reporter_uid=uid)
+                kd_by_uid, side_win, unmatched, missing = _match_ocr_to_roster(
+                    m, ocr_result, reporter_uid=uid,
+                    prior_kd_by_uid=prior_kd_by_uid, prior_side_win=prior_side_win,
+                )
+            else:
+                # Этот конкретный скрин не распознался, но у нас уже могли
+                # быть накопленные данные от предыдущих скринов — считаем missing
+                # относительно них, а не сбрасываем всё в ноль.
+                all_uids = [u for u in (m.get("ct", []) + m.get("t", [])) if not _is_bot_uid(u)]
+                missing = [get_player(u).nickname for u in all_uids if u not in kd_by_uid]
         except Exception as e:
             print(f"[result] ocr error: {e!r}")
             ocr_result = None
@@ -4695,13 +4879,25 @@ async def _process_result_screenshot(m_id: str, m: dict, uid: int, msg, context:
             except Exception as e:
                 print(f"[result] admin forward error: {e!r}")
 
-        ocr_ok = bool(ocr_result) and side_win is not None and not unmatched and not missing and len(kd_by_uid) >= 2
+        shots_count = prior_shots + 1
+
+        # ── Автодоставка отсутствующих игроков ──────────────────────────
+        # Победитель уже известен и остаётся кто-то без строки — считаем,
+        # что это игроки проигравшей стороны, которые не отыграли катку
+        # (не зашли/дисконнект), и проставляем им 0/8 автоматически.
+        filled_auto: List[str] = []
+        if side_win in ("ct", "t") and missing:
+            filled_auto = _fill_missing_players_as_losers(m, kd_by_uid, side_win)
+            all_uids = [u for u in (m.get("ct", []) + m.get("t", [])) if not _is_bot_uid(u)]
+            missing = [get_player(u).nickname for u in all_uids if u not in kd_by_uid]
+
+        ocr_ok = (bool(ocr_result) or bool(prior)) and side_win is not None and not unmatched and not missing and len(kd_by_uid) >= 2
 
         if not ocr_ok:
             reasons = []
             if not _ocr_available():
                 reasons.append("на сервере не настроен OCR (tesseract не найден — проверь Aptfile/requirements.txt на Railway)")
-            elif not ocr_result:
+            elif not ocr_result and not prior:
                 reasons.append("не нашёл таблицу на скрине (плохой ракурс/качество/не тот интерфейс)")
             else:
                 if side_win is None:
@@ -4711,15 +4907,35 @@ async def _process_result_screenshot(m_id: str, m: dict, uid: int, msg, context:
                 if missing:
                     reasons.append("не нашёл строку для: " + ", ".join(missing))
 
-            # Помечаем матч как «есть скрин, но не распознан» — это увидит
-            # любой админ/мод через кнопку «🧾 Результаты матчей» в ЛС,
-            # даже если он не сидит в админ-конфе.
+            # Сохраняем накопленный прогресс — если это не первый скрин по
+            # матчу, следующий присланный скрин (от другого игрока или того
+            # же) продолжит достраивать этот же результат, а не начнёт с нуля.
+            if kd_by_uid or side_win:
+                db.setdefault("pending_ocr", {})[m_id] = {
+                    "side":               side_win,
+                    "kd_by_uid":          {str(k): list(v) for k, v in kd_by_uid.items()},
+                    "reported_by":        uid,
+                    "screenshots_count":  shots_count,
+                    "filled_auto":        filled_auto,
+                }
+
+            # Помечаем матч как «есть скрин, но не распознан полностью» —
+            # это увидит любой админ/мод через кнопку «🧾 Результаты матчей»
+            # в ЛС, даже если он не сидит в админ-конфе.
             db.setdefault("unresolved_results", {})[m_id] = {
                 "reported_by": uid,
                 "reasons":     reasons,
                 "ts":          time.time(),
             }
             save_db(db)
+
+            progress_line = ""
+            if kd_by_uid:
+                progress_line = (
+                    f"\nУже есть данные по {len(kd_by_uid)} из "
+                    f"{len([u for u in (m.get('ct', []) + m.get('t', [])) if not _is_bot_uid(u)])} игроков "
+                    f"(из {shots_count} скрин(ов)) — ждём остальные скрины или ручной ввод."
+                )
 
             if ADMIN_GROUP_ID:
                 await context.bot.send_message(
@@ -4728,8 +4944,10 @@ async def _process_result_screenshot(m_id: str, m: dict, uid: int, msg, context:
                         f"📸 Скрин результатов матча #{m_id}\n"
                         f"От: {p.tg_link()}\n\n"
                         f"⚠️ Бот не смог уверенно распознать результат автоматически "
-                        f"({'; '.join(reasons) if reasons else 'неизвестная причина'}).\n"
-                        f"Проверьте вручную и введите <code>/win {m_id} ct|t ...</code>."
+                        f"({'; '.join(reasons) if reasons else 'неизвестная причина'})."
+                        f"{progress_line}\n"
+                        f"Проверьте вручную и введите <code>/win {m_id} ct|t ...</code>, "
+                        f"либо дождитесь ещё одного скрина от другого игрока матча."
                     ),
                     parse_mode=ParseMode.HTML,
                 )
@@ -4740,9 +4958,11 @@ async def _process_result_screenshot(m_id: str, m: dict, uid: int, msg, context:
 
         # ── Уверенно распознали — кладём в очередь на подтверждение админом ──
         db.setdefault("pending_ocr", {})[m_id] = {
-            "side":        side_win,
-            "kd_by_uid":   {str(k): list(v) for k, v in kd_by_uid.items()},
-            "reported_by": uid,
+            "side":               side_win,
+            "kd_by_uid":          {str(k): list(v) for k, v in kd_by_uid.items()},
+            "reported_by":        uid,
+            "screenshots_count":  shots_count,
+            "filled_auto":        filled_auto,
         }
         save_db(db)
 
