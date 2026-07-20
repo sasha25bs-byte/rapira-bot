@@ -102,8 +102,8 @@ if _beseda_chat_env.lstrip("-").isdigit():
     BESEDA_CHAT_ID = int(_beseda_chat_env)
 else:
     BESEDA_CHAT_ID = BESEDA_USERNAME
-SEASON_NAME     = "Test Season"
-SEASON_END      = "20.07.2026"
+SEASON_NAME     = "🌑 Blackout Season"
+SEASON_END      = "15.09.2026"
 
 MAPS_LIST      = ["Dust 2", "Mirage"]
 
@@ -1312,6 +1312,7 @@ def main_menu_kb(uid: int, reg: bool) -> InlineKeyboardMarkup:
     keyboard.append([InlineKeyboardButton("🔍 Найти матч", callback_data="cmd_play")])
     if reg:
         keyboard.append([InlineKeyboardButton("📊 Мой профиль", callback_data="cmd_stats")])
+        keyboard.append([InlineKeyboardButton("🎮 Платформа", callback_data="cmd_platform")])
     else:
         keyboard.append([InlineKeyboardButton("📝 Регистрация", callback_data="cmd_reg")])
     keyboard.append([
@@ -1458,7 +1459,13 @@ async def reg_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def platform_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/platform pc|mobile [user_id] — выбор платформы. Админ может менять другим игрокам."""
+    """/platform pc|mobile [user_id] — выбор платформы. Доступно только в ЛС с ботом."""
+    if update.effective_chat.type != "private":
+        await update.message.reply_text(
+            "🎮 Платформу можно поменять только в ЛС с ботом — напишите /start и нажмите «🎮 Платформа»."
+        )
+        return
+
     uid     = update.effective_user.id
     db      = load_db()
     admin   = is_admin(uid)
@@ -3006,11 +3013,10 @@ RULES_TEXT = (
 )
 
 SEASON_TEXT = (
-    f"✨ <b>{SEASON_NAME}</b>\n\n"
-    "Добро пожаловать в первый тестовый сезон Night Faceit.\n"
-    f"{SEASON_NAME} — это запуск обновлённой соревновательной системы, "
-    "механики ELO и лобби 5v5/2v2.\n\n"
-    "Каждый матч влияет на твою позицию в топе.\n\n"
+    f"{SEASON_NAME}\n\n"
+    "Свет погас — начался новый отсчёт. Рейтинг обнулён, калибровка заново.\n"
+    "Пять матчей решат твоё место в новом топе.\n\n"
+    "🏆 <b>Приз за 1 место по итогам сезона: 2000 голды</b>\n\n"
     f"✨ <i>Сезон заканчивается {SEASON_END}</i>"
 )
 
@@ -3069,6 +3075,29 @@ async def resetdb_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.HTML
     )
 
+def _reset_season_stats(db: Dict[str, Any]) -> int:
+    """Обнуляет игровую статистику (победы/поражения/ELO/K/D) у всех реальных
+    игроков, сохраняя регистрацию/ник/платформу. Возвращает число сброшенных
+    игроков. Используется и /newseason, и кнопкой «Новый сезон» в админ-панели."""
+    players = db.get("players", {})
+    reset_fields = {
+        "wins": 0, "losses": 0,
+        "wins_5v5": 0, "losses_5v5": 0,
+        "wins_2v2": 0, "losses_2v2": 0,
+        "avg": 0.0, "avg_5v5": 0.0, "avg_2v2": 0.0,
+        "elo": 0, "elo_5v5": 0, "elo_2v2": 0,
+        "total_kills": 0, "total_deaths": 0,
+    }
+    reset_count = 0
+    for s, pdata in players.items():
+        if pdata.get("is_bot"):
+            continue
+        for field, val in reset_fields.items():
+            pdata[field] = val
+        reset_count += 1
+    return reset_count
+
+
 async def newseason_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Только владелец — начинает новый сезон: обнуляет ВСЮ игровую статистику
     (победы/поражения по режимам, ЭЛО, средний винрейт, киллы/смерти) у всех
@@ -3089,22 +3118,7 @@ async def newseason_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     db = load_db()
-    players = db.get("players", {})
-    reset_fields = {
-        "wins": 0, "losses": 0,
-        "wins_5v5": 0, "losses_5v5": 0,
-        "wins_2v2": 0, "losses_2v2": 0,
-        "avg": 0.0, "avg_5v5": 0.0, "avg_2v2": 0.0,
-        "elo": 0, "elo_5v5": 0, "elo_2v2": 0,
-        "total_kills": 0, "total_deaths": 0,
-    }
-    reset_count = 0
-    for s, pdata in players.items():
-        if pdata.get("is_bot"):
-            continue
-        for field, val in reset_fields.items():
-            pdata[field] = val
-        reset_count += 1
+    reset_count = _reset_season_stats(db)
 
     save_db(db)
     await _sync_db_to_telegram()
@@ -3608,6 +3622,48 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception:
             pass
+        return
+
+    # ── ПЛАТФОРМА (только ЛС) ────────────────────────────────────────────────
+    if cb == "cmd_platform":
+        await q.answer()
+        db = load_db()
+        s  = str(uid)
+        if s not in db["players"] or not db["players"][s].get("external_id"):
+            await _menu_edit(
+                q, "❌ Сначала нужно зарегистрироваться.",
+                InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ В главное меню", callback_data="cmd_menu")]])
+            )
+            return
+        cur       = db["players"][s].get("platform", "pc")
+        cur_label = "📱 Мобильный" if cur == "mobile" else "🖥 ПК"
+        await _menu_edit(
+            q,
+            f"🎮 Текущая платформа: <b>{cur_label}</b>\n\nВыбери новую платформу:",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("🖥 ПК", callback_data="platform_set_pc"),
+                 InlineKeyboardButton("📱 Мобильный", callback_data="platform_set_mobile")],
+                [InlineKeyboardButton("⬅️ В главное меню", callback_data="cmd_menu")],
+            ])
+        )
+        return
+
+    if cb in ("platform_set_pc", "platform_set_mobile"):
+        choice = "pc" if cb == "platform_set_pc" else "mobile"
+        db = load_db()
+        s  = str(uid)
+        if s not in db["players"] or not db["players"][s].get("external_id"):
+            await q.answer("❌ Сначала нужно зарегистрироваться.", show_alert=True)
+            return
+        db["players"][s]["platform"] = choice
+        save_db(db)
+        await q.answer("✅ Платформа обновлена")
+        label = "📱 Мобильный" if choice == "mobile" else "🖥 ПК"
+        await _menu_edit(
+            q,
+            f"✅ Платформа изменена: <b>{label}</b>",
+            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ В главное меню", callback_data="cmd_menu")]])
+        )
         return
 
     # ── МОЙ ПРОФИЛЬ ───────────────────────────────────────────────────────────
@@ -4818,6 +4874,8 @@ def ap_main_kb(uid: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton("📋 Матчи",    callback_data="ap_matches"),
             InlineKeyboardButton("🗑 Очередь",  callback_data="ap_clearqueue"),
         ])
+    if is_creator(uid):
+        rows.append([InlineKeyboardButton("🆕 Новый сезон", callback_data="ap_newseason")])
     rows.append([InlineKeyboardButton("⬅️ В главное меню", callback_data="cmd_menu")])
     return InlineKeyboardMarkup(rows)
 
@@ -5030,6 +5088,44 @@ async def _ap_callback(q, context: ContextTypes.DEFAULT_TYPE, cb: str) -> None:
             db[q_key] = []
         save_db(db)
         await _menu_edit(q, "🗑 Очередь очищена.", AP_BACK_KB); return
+
+    if cb == "ap_newseason":
+        if not is_creator(uid):
+            await _ap_show_main(q, context); return
+        await _menu_edit(
+            q,
+            "⚠️ <b>Начать новый сезон?</b>\n\n"
+            "Это обнулит статистику ВСЕХ игроков (победы, поражения, ЭЛО, K/D). "
+            "Регистрация, ники, ID и платформы сохранятся — заново регистрироваться не нужно. "
+            "Все игроки заново пройдут калибровку.\n\n"
+            "Действие необратимо.",
+            InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Подтвердить", callback_data="ap_newseason_confirm"),
+                InlineKeyboardButton("❌ Отменить",    callback_data="ap_newseason_cancel"),
+            ]])
+        )
+        return
+
+    if cb == "ap_newseason_cancel":
+        await _menu_edit(q, "❌ Новый сезон не начат.", AP_BACK_KB); return
+
+    if cb == "ap_newseason_confirm":
+        if not is_creator(uid):
+            await _ap_show_main(q, context); return
+        db = load_db()
+        reset_count = _reset_season_stats(db)
+        save_db(db)
+        await _sync_db_to_telegram()
+        await _menu_edit(
+            q,
+            f"🆕 <b>Новый сезон начат!</b>\n\n"
+            f"Статистика обнулена у <b>{reset_count}</b> игроков: победы, поражения, "
+            f"ЭЛО и K/D сброшены в 0.\n"
+            f"Регистрация, никнеймы, ID и платформы сохранены.\n"
+            f"Все игроки снова проходят калибровку ({CALIBRATION_GAMES} матчей).",
+            AP_BACK_KB
+        )
+        return
 
     st = _ap_state(context)
 
@@ -6244,16 +6340,12 @@ async def set_commands(app: Application):
 
     # ── Беседа/группы: полный список команд, как раньше.
     group_commands = [
-        BotCommand("start",   "Главное меню"),
         BotCommand("reg",     "Регистрация"),
-        BotCommand("platform","Выбор платформы ПК/мобила"),
         BotCommand("5v5",    "Лобби 5v5"),
         BotCommand("2v2",    "Лобби 2v2"),
         BotCommand("stats",   "Мой профиль"),
         BotCommand("top",     "Топ игроков"),
-        BotCommand("ticket",  "Написать в поддержку"),
         BotCommand("admins",  "Команды по ролям"),
-        BotCommand("rules",   "Правила чата"),
     ]
     await app.bot.set_my_commands(group_commands, scope=BotCommandScopeAllGroupChats())
     # Дефолтный scope — на случай супергрупп/каналов, не покрытых явными scope'ами.
