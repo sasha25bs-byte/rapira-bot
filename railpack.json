@@ -1,0 +1,10 @@
+{
+  "$schema": "https://schema.railpack.com",
+  "packages": {
+    "apt": [
+      "tesseract-ocr",
+      "tesseract-ocr-rus",
+      "tesseract-ocr-eng"
+    ]
+  }
+}
