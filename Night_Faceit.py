@@ -14,10 +14,6 @@ import aiohttp
 from aiohttp import web
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
-try:
-    import pytesseract  # распознавание скорборда со скриншота (см. parse_scoreboard_ocr)
-except ImportError:
-    pytesseract = None
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, MenuButtonWebApp, WebAppInfo,
     ChatPermissions, BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats, BotCommandScopeDefault,
@@ -96,6 +92,16 @@ def is_youtuber(uid: int) -> bool:
 # ── БЕСЕДА / СЕЗОН ────────────────────────────────
 BESEDA_LINK     = "https://t.me/faceitggvp"   # ссылка на беседу (там играются матчи)
 BESEDA_USERNAME = "@faceitggvp"               # username беседы для проверки подписки
+
+# ID/username беседы, куда реально применяются бан/мут при выдаче наказания
+# из админ-панели в ЛС (там effective_chat.id недоступен — это ЛС, а не беседа).
+# Можно переопределить числовым ID через переменную окружения BESEDA_CHAT_ID
+# (Telegram отдаёт числовой chat_id в апдейтах беседы — его же можно сюда вписать).
+_beseda_chat_env = _os.environ.get("BESEDA_CHAT_ID", "").strip()
+if _beseda_chat_env.lstrip("-").isdigit():
+    BESEDA_CHAT_ID = int(_beseda_chat_env)
+else:
+    BESEDA_CHAT_ID = BESEDA_USERNAME
 SEASON_NAME     = "Test Season"
 SEASON_END      = "20.07.2026"
 
@@ -111,10 +117,8 @@ BAN_TIMEOUT    = 90
 # показывается прогресс калибровки, а сам игрок не попадает в топ.
 CALIBRATION_GAMES = 5
 
-ELO_WIN_PC       = 15
-ELO_LOSS_PC      = 30
-ELO_WIN_MOBILE   = 25
-ELO_LOSS_MOBILE  = 20
+ELO_WIN_BASE     = 25   # базовое начисление за победу у игрока со средним ELO
+ELO_LOSS_BASE    = 20   # базовое списание за поражение у игрока со средним ELO
 ELO_MIN      = 100
 BOT_ID_START = -100000
 
@@ -129,12 +133,57 @@ BOT_ID_START = -100000
 CALIBRATION_BASE_ELO  = 1000
 CALIBRATION_SWING     = 800
 
+# ── ДИНАМИЧЕСКОЕ НАЧИСЛЕНИЕ ELO ──────────────────────────────────────
+# Чем выше текущий рейтинг игрока — тем МЕНЬШЕ ELO он получает за победу и
+# тем БОЛЬШЕ теряет за поражение (и наоборот для игроков с низким рейтингом:
+# новичкам и отстающим ELO начисляется щедрее, чтобы они быстрее нашли своё
+# место в топе). Базовые константы ELO_WIN_*/ELO_LOSS_* остаются "как есть"
+# ровно у игрока со средним рейтингом (ELO_DYNAMIC_MID) — множитель там = 1.0.
+# Ниже/выше этой точки множитель линейно едет к ELO_*_MULT_LOW/HIGH, дальше
+# зажимается по границам ELO_DYNAMIC_LOW_BOUND / ELO_DYNAMIC_HIGH_BOUND.
+ELO_DYNAMIC_LOW_BOUND  = 400              # на этом ELO и ниже — множитель максимальный
+ELO_DYNAMIC_MID        = CALIBRATION_BASE_ELO  # тут множитель = 1.0 (без изменений)
+ELO_DYNAMIC_HIGH_BOUND = 1900             # на этом ELO и выше — множитель минимальный
 
-def elo_deltas_for(platform: str) -> tuple:
-    """Возвращает (плюс_за_победу, минус_за_поражение) в зависимости от платформы."""
-    if platform == "mobile":
-        return ELO_WIN_MOBILE, ELO_LOSS_MOBILE
-    return ELO_WIN_PC, ELO_LOSS_PC
+ELO_WIN_MULT_LOW   = 1.4   # x1.4 к начислению за победу на низком ELO
+ELO_WIN_MULT_HIGH  = 0.5   # x0.5 к начислению за победу на высоком ELO
+ELO_LOSS_MULT_LOW  = 0.7   # x0.7 к списанию за поражение на низком ELO
+ELO_LOSS_MULT_HIGH = 1.4   # x1.4 к списанию за поражение на высоком ELO
+
+
+def _dynamic_elo_multiplier(current_elo: int, mult_low: float, mult_high: float) -> float:
+    """
+    Линейно интерполирует множитель между mult_low (на ELO_DYNAMIC_LOW_BOUND
+    и ниже) и mult_high (на ELO_DYNAMIC_HIGH_BOUND и выше), проходя ровно
+    через 1.0 на ELO_DYNAMIC_MID.
+    """
+    e = current_elo
+    if e <= ELO_DYNAMIC_LOW_BOUND:
+        return mult_low
+    if e >= ELO_DYNAMIC_HIGH_BOUND:
+        return mult_high
+    if e <= ELO_DYNAMIC_MID:
+        t = (e - ELO_DYNAMIC_LOW_BOUND) / (ELO_DYNAMIC_MID - ELO_DYNAMIC_LOW_BOUND)
+        return mult_low + (1.0 - mult_low) * t
+    t = (e - ELO_DYNAMIC_MID) / (ELO_DYNAMIC_HIGH_BOUND - ELO_DYNAMIC_MID)
+    return 1.0 + (mult_high - 1.0) * t
+
+
+def elo_deltas_for(current_elo: int = CALIBRATION_BASE_ELO) -> tuple:
+    """
+    Возвращает (плюс_за_победу, минус_за_поражение) в зависимости от текущего
+    ELO игрока. Чем выше рейтинг — тем меньше начисляется за победу и тем
+    больше списывается за поражение; чем ниже — тем щедрее начисление и
+    мягче списание. См. блок "ДИНАМИЧЕСКОЕ НАЧИСЛЕНИЕ ELO" выше.
+    Если текущий ELO не передан (например, для превью до регистрации),
+    используется средний рейтинг — тогда возвращаются базовые значения
+    ELO_WIN_BASE/ELO_LOSS_BASE без изменений.
+    """
+    win_mult  = _dynamic_elo_multiplier(current_elo, ELO_WIN_MULT_LOW,  ELO_WIN_MULT_HIGH)
+    loss_mult = _dynamic_elo_multiplier(current_elo, ELO_LOSS_MULT_LOW, ELO_LOSS_MULT_HIGH)
+    win_d  = max(1, round(ELO_WIN_BASE  * win_mult))
+    loss_d = max(1, round(ELO_LOSS_BASE * loss_mult))
+    return win_d, loss_d
 
 NOT_REGISTERED_MSG = (
     "❌ <b>Вы не зарегистрированы!</b>\n\n"
@@ -176,7 +225,6 @@ class Player:
     is_bot:        bool  = False
     total_kills:   int   = 0
     total_deaths:  int   = 0
-    platform:      str   = "pc"   # "pc" или "mobile" — влияет на начисление ELO за /win
     registered_ts: float = 0.0    # unix-время реальной регистрации (0 = неизвестно, старая запись)
 
     def lvl_icon(self) -> str:
@@ -237,8 +285,6 @@ def load_db() -> Dict[str, Any]:
         "players": {}, "match_counter": 0, "active_matches": {},
         "queue_5v5": [], "queue_2v2": [], "lobby_5v5": {}, "lobby_2v2": {}, "muted": {}, "banned": {}, "bot_counter": 0,
         "tickets": {}, "ticket_counter": 0, "user_open_ticket": {},
-        "pending_ocr": {},      # m_id -> распознанный ботом результат матча, ждёт подтверждения админа
-        "unresolved_results": {},  # m_id -> скрин прислали, но OCR не распознал — нужна ручная проверка
         "dm_result_wait": {},   # str(uid) -> m_id: игрок нажал «Отправить результат» в ЛС и должен прислать скрин
     }
     if not os.path.exists(DATA_FILE):
@@ -1262,7 +1308,7 @@ def main_menu_kb(uid: int, reg: bool) -> InlineKeyboardMarkup:
     ])
     if is_moderator(uid):
         keyboard.append([InlineKeyboardButton("🌙 Команда Faceit", callback_data="cmd_admins")])
-        keyboard.append([InlineKeyboardButton("🧾 Результаты матчей", callback_data="cmd_pending_list")])
+        keyboard.append([InlineKeyboardButton("🛠 Админ-панель", callback_data="ap_open")])
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -1468,7 +1514,9 @@ async def platform_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db["players"][s]["platform"] = choice
     save_db(db)
     label          = "📱 Мобильный" if choice == "mobile" else "🖥 ПК"
-    win_d, loss_d  = elo_deltas_for(choice)
+    _preview_p     = get_player(target_uid)
+    _preview_elo   = _preview_p.elo if _preview_p.is_calibrated else CALIBRATION_BASE_ELO
+    win_d, loss_d  = elo_deltas_for(choice, _preview_elo)
 
     if changing_other:
         target_p = get_player(target_uid)
@@ -2990,7 +3038,7 @@ async def resetdb_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "queue_5v5": [], "queue_2v2": [], "lobby_5v5": {}, "lobby_2v2": {},
         "muted": {}, "banned": {}, "bot_counter": 0, "warns": {},
         "tickets": {}, "ticket_counter": 0, "user_open_ticket": {},
-        "pending_ocr": {}, "dm_result_wait": {}, "unresolved_results": {},
+        "dm_result_wait": {},
     }
     _db_cache = empty
     with open(DATA_FILE, "w", encoding="utf-8") as f:
@@ -3460,132 +3508,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer("🔇 Вы в муте — любые действия запрещены!", show_alert=True)
             return
 
-    # ── АДМИН/МОД: БЫСТРЫЙ ШАБЛОН /win С ПОДСТАВЛЕННЫМИ ID ────────────────────
-    if cb.startswith("wintpl_ct:") or cb.startswith("wintpl_t:"):
-        if not is_moderator(uid):
-            await q.answer("❌ Недостаточно прав.", show_alert=True)
-            return
-        side = "ct" if cb.startswith("wintpl_ct:") else "t"
-        m_id = cb.split(":", 1)[1]
-        db = load_db()
-        m = db.get("active_matches", {}).get(m_id)
-        if not m:
-            await q.answer("❌ Матч уже закрыт.", show_alert=True)
-            return
-        await q.answer()
-
-        # ── Пересылаем все присланные по матчу скрины прямо в ЛС админу,
-        # который жмёт кнопку — чтобы фото и шаблон для заполнения были
-        # рядом друг с другом, без пролистывания истории чата. ────────────
-        shots = (
-            db.get("pending_ocr", {}).get(m_id, {}).get("screenshots")
-            or db.get("unresolved_results", {}).get(m_id, {}).get("screenshots")
-            or []
-        )
-        if shots:
-            try:
-                await context.bot.send_message(chat_id=uid, text=f"📸 Скрины по матчу #{m_id}:")
-            except Exception:
-                pass
-            for shot in shots:
-                sender = get_player(shot.get("from_uid")) if shot.get("from_uid") else None
-                caption = f"От: {sender.nickname}" if sender else None
-                try:
-                    await context.bot.forward_message(
-                        chat_id=uid,
-                        from_chat_id=shot["chat_id"],
-                        message_id=shot["message_id"],
-                    )
-                    if caption:
-                        await context.bot.send_message(chat_id=uid, text=caption)
-                except Exception as e:
-                    print(f"[wintpl] не удалось переслать скрин: {e!r}")
-
-        template = _build_win_template(m_id, m, side)
-        win_label = "🔵 CT" if side == "ct" else "🔴 T"
-        try:
-            await context.bot.send_message(
-                chat_id=uid,
-                text=(
-                    f"📋 <b>Шаблон для матча #{m_id}</b>\n"
-                    f"Победила сторона: {win_label}\n\n"
-                    f"Впишите реальные киллы/смерти вместо нулей (сверьтесь со "
-                    f"скрином выше) и отправьте сообщение как есть:\n\n"
-                    f"<code>{template}</code>"
-                ),
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception:
-            pass
-        return
-
-    # ── ПОДТВЕРЖДЕНИЕ РАСПОЗНАННОГО РЕЗУЛЬТАТА МАТЧА (OCR) ────────────────────
-    if cb.startswith("ocrwin_confirm:") or cb.startswith("ocrwin_manual:"):
-        if not is_moderator(uid):
-            await q.answer("❌ Недостаточно прав.", show_alert=True)
-            return
-        action, m_id = cb.split(":", 1)
-        db = load_db()
-
-        if action == "ocrwin_manual":
-            db.get("pending_ocr", {}).pop(m_id, None)
-            save_db(db)
-            await q.answer()
-            try:
-                await q.edit_message_text(
-                    (q.message.text or "") + f"\n\n✏️ Отклонено — введите результат командой /win {m_id} ...",
-                    parse_mode=ParseMode.HTML,
-                )
-            except Exception:
-                pass
-            return
-
-        # ocrwin_confirm
-        pending = db.get("pending_ocr", {}).get(m_id)
-        m = db.get("active_matches", {}).get(m_id)
-        if not pending or not m:
-            await q.answer("❌ Матч уже обработан или недоступен.", show_alert=True)
-            return
-
-        await q.answer()
-        side = pending["side"]
-        kd_by_uid = {int(k): tuple(v) for k, v in pending["kd_by_uid"].items()}
-
-        win_lines, loss_lines, calib_notifications, mode, winners, losers = _finalize_match(
-            db, m_id, m, side, kd_by_uid
-        )
-        db.get("pending_ocr", {}).pop(m_id, None)
-        save_db(db)
-        await _send_calibration_dms(context.bot, calib_notifications)
-
-        text = _build_finished_match_card(
-            m_id, mode, side, win_lines, loss_lines, kd_by_uid, winners, losers,
-            confirmed_by=q.from_user.first_name,
-        )
-        try:
-            await q.edit_message_text(text, parse_mode=ParseMode.HTML)
-        except Exception:
-            await context.bot.send_message(chat_id=q.message.chat_id, text=text, parse_mode=ParseMode.HTML)
-
-        # ── Сразу показываем админу другие незакрытые матчи, если есть ──────
-        remaining = db.get("pending_ocr", {})
-        if remaining:
-            try:
-                await context.bot.send_message(
-                    chat_id=uid,
-                    text=f"🧾 Есть ещё {len(remaining)} матч(ей), ожидающих подтверждения результата:",
-                )
-            except Exception:
-                pass
-            for next_id, next_pending in list(remaining.items())[:3]:
-                next_m = db.get("active_matches", {}).get(next_id)
-                if not next_m:
-                    continue
-                text2, kb2 = _build_ocr_confirm_card(next_id, next_m, next_pending)
-                try:
-                    await context.bot.send_message(chat_id=uid, text=text2, parse_mode=ParseMode.HTML, reply_markup=kb2)
-                except Exception:
-                    pass
+    # ── АДМИН-ПАНЕЛЬ (ЛС) ───────────────────────────────────────────────────
+    if cb.startswith("ap_"):
+        await _ap_callback(q, context, cb)
         return
 
     # ── ИГРОК ЖМЁТ «ОТПРАВИТЬ РЕЗУЛЬТАТ» В ЛС ────────────────────────────────
@@ -3611,61 +3536,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception:
             pass
-        return
-
-    # ── АДМИН/МОД: СПИСОК МАТЧЕЙ, ОЖИДАЮЩИХ ПОДТВЕРЖДЕНИЯ РЕЗУЛЬТАТА ─────────
-    if cb == "cmd_pending_list":
-        if not is_moderator(uid):
-            await q.answer("❌ Недостаточно прав.", show_alert=True)
-            return
-        await q.answer()
-        db = load_db()
-        pending    = db.get("pending_ocr", {})
-        unresolved = db.get("unresolved_results", {})
-        if not pending and not unresolved:
-            try:
-                await context.bot.send_message(chat_id=uid, text="✅ Нет матчей, ожидающих подтверждения результата.")
-            except Exception:
-                pass
-            return
-        sent_any = False
-        for m_id, p_data in pending.items():
-            m = db.get("active_matches", {}).get(m_id)
-            if not m:
-                continue
-            text, kb = _build_ocr_confirm_card(m_id, m, p_data)
-            try:
-                await context.bot.send_message(chat_id=uid, text=text, parse_mode=ParseMode.HTML, reply_markup=kb)
-                sent_any = True
-            except Exception:
-                pass
-        for m_id, u_data in unresolved.items():
-            if m_id in pending:
-                continue  # уже показали выше как распознанный
-            m = db.get("active_matches", {}).get(m_id)
-            if not m:
-                continue
-            reporter = get_player(u_data.get("reported_by")) if u_data.get("reported_by") else None
-            reasons = u_data.get("reasons") or []
-            text = (
-                f"📸 <b>Матч #{m_id}</b> — прислан скрин, но бот <u>не смог распознать</u> результат.\n"
-                + (f"Причина: {'; '.join(reasons)}\n" if reasons else "") +
-                (f"\nОт: {reporter.tg_link()}" if reporter else "") +
-                f"\n\nНажмите кнопку — получите готовый шаблон /win с подставленными ID."
-            )
-            try:
-                await context.bot.send_message(
-                    chat_id=uid, text=text, parse_mode=ParseMode.HTML,
-                    reply_markup=_win_template_buttons(m_id),
-                )
-                sent_any = True
-            except Exception:
-                pass
-        if not sent_any:
-            try:
-                await context.bot.send_message(chat_id=uid, text="✅ Нет матчей, ожидающих подтверждения результата.")
-            except Exception:
-                pass
         return
 
     # ── ГЛАВНОЕ МЕНЮ (ЛС) ────────────────────────────────────────────────────
@@ -4298,9 +4168,8 @@ def _apply_win_to_player(
     """
     Начисляет/списывает ELO одному игроку, обновляет W/L, винрейт, накопительный
     KD и (если только что закончилась калибровка) выдаёт стартовый ранг.
-    Вынесено в отдельную функцию, чтобы одинаково применялось что из /win
-    (ручной ввод), что из авто-подтверждения результата, распознанного ботом
-    со скриншота (см. parse_scoreboard_ocr + callback ocrwin_confirm).
+    Вынесено в отдельную функцию, чтобы одинаково применялось для каждого
+    игрока при подведении итога матча через /win.
     """
     if _is_bot_uid(target_uid):
         return
@@ -4309,11 +4178,11 @@ def _apply_win_to_player(
     if not pdata:
         return
 
-    platform      = pdata.get("platform", "pc")
-    win_d, loss_d = elo_deltas_for(platform)
+    platform         = pdata.get("platform", "pc")
+    elo_before       = pdata.get("elo", 0)
+    elo_mode_before  = pdata.get(f"elo_{mode}", 0)
+    win_d, loss_d    = elo_deltas_for(platform, elo_before)
 
-    elo_before      = pdata.get("elo", 0)
-    elo_mode_before = pdata.get(f"elo_{mode}", 0)
     games_before     = pdata.get("wins", 0) + pdata.get("losses", 0)
     was_calibrated   = games_before >= CALIBRATION_GAMES
 
@@ -4440,8 +4309,7 @@ def _finalize_match(db: Dict[str, Any], m_id: str, m: dict, side: str, kd_by_uid
     Общее ядро завершения матча: начисляет результат обеим сторонам,
     сохраняет снапшот в finished_matches (для /cancelwin), убирает матч
     из active_matches. НЕ вызывает save_db и не шлёт сообщений — это
-    делает вызывающий код (win_cmd / ocrwin_confirm), т.к. им нужно
-    показать разный текст пользователю.
+    делает вызывающий код (win_cmd), т.к. ему нужно показать текст пользователю.
     Возвращает (win_lines, loss_lines, calib_notifications, mode, winners, losers).
     """
     winners = m.get("ct", []) if side == "ct" else m.get("t", [])
@@ -4470,710 +4338,40 @@ def _finalize_match(db: Dict[str, Any], m_id: str, m: dict, side: str, kd_by_uid
         "finished_ts":  datetime.now().timestamp(),
     }
     db["active_matches"].pop(m_id, None)
-    db.get("unresolved_results", {}).pop(m_id, None)
 
     return win_lines, loss_lines, calib_notifications, mode, winners, losers
 
 
-# ════════════════════════════════════════════════
-#     РАСПОЗНАВАНИЕ СКОРБОРДА (OCR, Tesseract)
-# ════════════════════════════════════════════════
-#
-# Бот пытается сам прочитать финальный скорборд со скриншота: ники, игровые
-# ID, киллы/смерти и счёт команд — чтобы не заставлять админа набирать всё
-# руками. Это ЭВРИСТИКА поверх OCR, а не идеальное распознавание: разные
-# разрешения экрана, HUD-элементы поверх таблицы (прицел, руки с ножом и т.п.),
-# засветы и обрезанные скрины будут иногда путать бота.
-#
-# Поэтому результат распознавания НИКОГДА не применяется сам по себе — бот
-# присылает админ-группе карточку "вот что я увидел" с кнопками
-# "✅ Подтвердить" / "✏️ Ввести вручную". Только нажатие кнопки применяет
-# результат. Если бот вообще не смог уверенно распознать таблицу — он прямо
-# так и скажет, и попросит ввести /win руками, как раньше.
-
-_OCR_RUS_LANG_CHECKED = False
-_OCR_RUS_LANG_OK = False
-
-
-def _ocr_available() -> bool:
-    """
-    True только если И pytesseract подключён, И у tesseract реально
-    установлен русский языковой пакет (tesseract-ocr-rus). Без него
-    lang="rus+eng" НЕ падает с ошибкой — Tesseract просто распознаёт
-    кириллицу как случайную латиницу/мусор ("ПОБЕДА" → "MOBEA «"), и весь
-    скрипт ниже молча не находит ни одного заголовка таблицы. Это самая
-    частая причина, почему бот пишет "не нашёл таблицу на скрине" на
-    абсолютно нормальных, чётких скриншотах — поэтому проверяем языковой
-    пакет явно один раз при первом обращении и кэшируем результат.
-    """
-    global _OCR_RUS_LANG_CHECKED, _OCR_RUS_LANG_OK
-    if pytesseract is None:
-        return False
-    if _OCR_RUS_LANG_CHECKED:
-        return _OCR_RUS_LANG_OK
-    _OCR_RUS_LANG_CHECKED = True
-    try:
-        langs = pytesseract.get_languages(config="")
-        _OCR_RUS_LANG_OK = "rus" in langs
-        if not _OCR_RUS_LANG_OK:
-            print(
-                "[ocr] ⚠️ ВНИМАНИЕ: языковой пакет 'rus' НЕ установлен в tesseract "
-                f"(доступны только: {langs}). Распознавание русских скриншотов "
-                "работать НЕ будет — Tesseract читает кириллицу как мусор без "
-                "явной ошибки. Добавь 'tesseract-ocr-rus' в Aptfile проекта на "
-                "Railway и передеплой."
-            )
-    except Exception as e:
-        print(f"[ocr] не удалось проверить список языков tesseract: {e!r}")
-        _OCR_RUS_LANG_OK = False
-    return _OCR_RUS_LANG_OK
-
-
-def parse_scoreboard_ocr(image_bytes: bytes) -> Optional[dict]:
-    """
-    Пытается разобрать скриншот результата матча. Игроки присылают ОДИН из
-    двух разных экранов игры, и оба нужно понимать одинаково хорошо:
-
-      Формат A — "в игре" (freeze-frame HUD после раунда/матча):
-        колонки подписаны полными словами "УБИЙСТВ" / "СМЕРТЕЙ", сверху есть
-        HUD-счёт команд (два числа рядом с таймером), и/или зелёный баннер
-        "ПОБЕДА"/"ПОРАЖЕНИЕ" поверх части строк. Игровой ID стоит СПРАВА от
-        ника (номер после имени).
-
-      Формат B — финальный экран "В МЕНЮ" (табло по окончании матча):
-        две колонки-таблицы бок о бок (Спецназ | Террористы), у каждой свои
-        заголовки "У" (убийств) и "С" (смертей) вместо полных слов, общий
-        счёт указан один раз сверху по центру каждой половины экрана
-        ("СПЕЦНАЗ ... <b>8</b> | <b>6</b> ... ТЕРРОРИСТЫ"). Игровой ID тоже
-        справа от ника.
-
-    Алгоритм:
-      1) Прогоняем изображение через Tesseract (рус+eng) → слова с координатами.
-      2) Пытаемся найти заголовки полными словами (формат A). Если не нашли —
-         ищем короткие заголовки "У"/"С" рядом друг с другом дважды (по разу
-         на каждую половину экрана формата B) и работаем с двумя независимыми
-         наборами колонок вместо одного.
-      3) Группируем найденные числа в строки по Y-координате.
-      4) В каждой строке: под "У"-колонкой → киллы, под "С"-колонкой → смерти,
-         число СПРАВА от ника (или слева, если справа не нашли) → игровой ID.
-      5) Цвет пикселя рядом с ником (синий/оранжевый) определяет команду —
-         подстраховка на случай формата B, где команды и так разнесены по
-         половинам экрана.
-      6) Счёт команд: либо два числа над таблицей по центру (формат A), либо
-         два числа в шапке "СПЕЦНАЗ X | Y ТЕРРОРИСТЫ" (формат B). Сторона с
-         большим числом — победитель. Плюс запасной сигнал — баннер "ПОБЕДА".
-
-    Возвращает None, если не удалось найти вообще ни одной таблицы (нет
-    заголовков) или строк меньше одной — тогда вызывающий код должен
-    откатиться на ручной ввод через /win.
-    """
-    if not _ocr_available():
-        return None
-    try:
-        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    except Exception:
-        return None
-
-    w, h = img.size
-    try:
-        data = pytesseract.image_to_data(img, lang="rus+eng", output_type=pytesseract.Output.DICT)
-    except Exception as e:
-        print(f"[ocr] tesseract error: {e!r}")
-        return None
-
-    words = []
-    for i in range(len(data.get("text", []))):
-        txt = (data["text"][i] or "").strip()
-        if not txt:
-            continue
-        try:
-            conf = int(float(data["conf"][i]))
-        except (ValueError, TypeError):
-            conf = -1
-        if conf < 25:
-            continue
-        words.append({
-            "text": txt,
-            "x": data["left"][i], "y": data["top"][i],
-            "w": data["width"][i], "h": data["height"][i],
-        })
-
-    # ── Ищем колонки-заголовки. Может быть НЕСКОЛЬКО пар (формат B — по
-    # паре на каждую половину экрана), поэтому всегда собираем список пар,
-    # а не одну пару, как раньше. ────────────────────────────────────────
-    col_pairs: List[dict] = []  # [{"kills_x":.., "deaths_x":.., "header_y":..}]
-
-    # Формат A: полные слова "УБИЙСТВ" / "СМЕРТЕЙ" — обычно ровно одна пара
-    # на весь экран (общая таблица на двоих).
-    full_kills = [wd for wd in words if "УБИЙСТ" in wd["text"].upper()]
-    full_deaths = [wd for wd in words if "СМЕРТ" in wd["text"].upper()]
-    if full_kills and full_deaths:
-        kw = full_kills[0]
-        dw = min(full_deaths, key=lambda wd: abs(wd["y"] - kw["y"]))
-        col_pairs.append({
-            "kills_x":  kw["x"] + kw["w"] // 2,
-            "deaths_x": dw["x"] + dw["w"] // 2,
-            "header_y": min(kw["y"], dw["y"]),
-        })
-
-    # Формат B: короткие одиночные заголовки "У" и "С" — на каждой половине
-    # экрана своя пара, соседствующая по Y и с "С" правее "У".
-    if not col_pairs:
-        short_u = [wd for wd in words if wd["text"].upper() in ("У", "K", "K/", "УБ") and wd["w"] < w * 0.06]
-        short_s = [wd for wd in words if wd["text"].upper() in ("С", "D", "СМ") and wd["w"] < w * 0.06]
-        for uw in short_u:
-            # Ищем "С" на той же строке (близкий Y) и правее по X.
-            same_row = [
-                swd for swd in short_s
-                if abs(swd["y"] - uw["y"]) < max(10, uw["h"])
-                and swd["x"] > uw["x"]
-            ]
-            if not same_row:
-                continue
-            sw = min(same_row, key=lambda wd: wd["x"] - uw["x"])
-            col_pairs.append({
-                "kills_x":  uw["x"] + uw["w"] // 2,
-                "deaths_x": sw["x"] + sw["w"] // 2,
-                "header_y": min(uw["y"], sw["y"]),
-            })
-
-    if not col_pairs:
-        return None  # не нашли ни одной шапки таблицы — не похоже на наш скорборд
-
-    col_tol = max(45, w // 18)
-    row_tol = max(16, h // 55)
-
-    rows: List[dict] = []
-    for pair in col_pairs:
-        kills_x, deaths_x, header_y = pair["kills_x"], pair["deaths_x"], pair["header_y"]
-
-        number_words = [wd for wd in words if wd["text"].isdigit() and wd["y"] > header_y]
-
-        rows_y: List[int] = []
-        for wd in sorted(number_words, key=lambda x: x["y"]):
-            if not any(abs(wd["y"] - ry) < row_tol for ry in rows_y):
-                rows_y.append(wd["y"])
-
-        for ry in rows_y:
-            row_nums = [wd for wd in number_words if abs(wd["y"] - ry) < row_tol]
-
-            def _closest(target_x, exclude=()):
-                cands = [wd for wd in row_nums if abs(wd["x"] - target_x) < col_tol and wd not in exclude]
-                return min(cands, key=lambda wd: abs(wd["x"] - target_x)) if cands else None
-
-            kills_cell  = _closest(kills_x)
-            deaths_cell = _closest(deaths_x, exclude=[kills_cell] if kills_cell else [])
-            if not kills_cell or not deaths_cell or kills_cell is deaths_cell:
-                continue
-
-            # Игровой ID — число в этой же строке, НЕ являющееся киллами/смертями.
-            # Ищем СНАЧАЛА справа от ника (форматы A и B кладут ID сразу после
-            # ника), затем слева — на случай другой раскладки экрана.
-            id_candidates = [
-                wd for wd in row_nums
-                if wd is not kills_cell and wd is not deaths_cell
-            ]
-            if not id_candidates:
-                continue
-            # ID — самое левое число из тех, что расположены заметно левее
-            # колонки "убийств" (т.е. явно не часть статы, а подпись у ника).
-            id_pool = [wd for wd in id_candidates if wd["x"] < kills_x - col_tol]
-            if not id_pool:
-                continue
-            id_cell = min(id_pool, key=lambda wd: wd["x"])
-
-            # Ник — весь нечисловой текст в строке. Может быть как слева от
-            # ID (формат A: "Ник ID"), так и всё равно слева (формат B тоже
-            # кладёт ник первым, потом ID) — в обоих случаях берём слова
-            # левее ID-ячейки.
-            nick_words = [
-                wd for wd in words
-                if not wd["text"].isdigit()
-                and abs(wd["y"] - ry) < row_tol
-                and wd["x"] < id_cell["x"] - 5
-                and wd["x"] < kills_x
-            ]
-            nick_words.sort(key=lambda wd: wd["x"])
-            nickname = " ".join(wd["text"] for wd in nick_words) if nick_words else None
-            if not nickname:
-                continue
-
-            sample_x = max(0, min(w - 1, nick_words[0]["x"] + 5))
-            sample_y = max(0, min(h - 1, ry + max(4, nick_words[0]["h"] // 2)))
-            try:
-                r, g, b = img.getpixel((sample_x, sample_y))[:3]
-            except Exception:
-                r, g, b = (0, 0, 0)
-            # Доп. сигнал команды: какая половина экрана (актуально для
-            # формата B, где команды физически разнесены влево/вправо).
-            side_hint = "left" if (kills_x < w / 2) else "right"
-            team = "blue" if b > r + 12 else ("orange" if r > b + 12 else "unknown")
-
-            rows.append({
-                "external_id": id_cell["text"],
-                "nickname":    nickname,
-                "kills":       int(kills_cell["text"]),
-                "deaths":      int(deaths_cell["text"]),
-                "team":        team,
-                "side_hint":   side_hint,
-            })
-
-    # Дедупликация — если формат A и B случайно дали пересекающиеся строки
-    # (не должно происходить, т.к. col_pairs формируются взаимоисключающе,
-    # но на всякий случай подстраховываемся по external_id).
-    seen_ids = set()
-    dedup_rows = []
-    for row in rows:
-        if row["external_id"] in seen_ids:
-            continue
-        seen_ids.add(row["external_id"])
-        dedup_rows.append(row)
-    rows = dedup_rows
-
-    if len(rows) < 1:
-        return None
-
-    header_y_min = min(p["header_y"] for p in col_pairs)
-
-    # ── Счёт команд, вариант 1: два числа над таблицей по центру экрана
-    # (формат A — HUD-счёт рядом с таймером). ────────────────────────────
-    score_candidates = [
-        wd for wd in words
-        if wd["text"].isdigit() and wd["y"] < header_y_min and len(wd["text"]) <= 2
-        and w * 0.30 < wd["x"] < w * 0.70
-    ]
-    score_candidates.sort(key=lambda wd: wd["x"])
-    blue_score = orange_score = None
-    if len(score_candidates) >= 2:
-        try:
-            blue_score   = int(score_candidates[0]["text"])
-            orange_score = int(score_candidates[1]["text"])
-        except ValueError:
-            blue_score = orange_score = None
-
-    # ── Счёт команд, вариант 2: формат B кладёт счёт как отдельные числа
-    # слева и справа от заголовка результата ("СПЕЦНАЗ  8   6  ТЕРРОРИСТЫ"),
-    # выше всех колонок-заголовков "У"/"С". Берём два "крупных" одиночных
-    # числа выше header_y_min, ближе к горизонтальному центру, но шире зоны
-    # варианта 1 (т.к. на широких экранах счёт может быть не строго по
-    # центру половины таблицы). ──────────────────────────────────────────
-    if blue_score is None or orange_score is None:
-        top_numbers = [
-            wd for wd in words
-            if wd["text"].isdigit() and wd["y"] < header_y_min and len(wd["text"]) <= 2
-        ]
-        top_numbers.sort(key=lambda wd: wd["x"])
-        if len(top_numbers) >= 2:
-            left_half  = [wd for wd in top_numbers if wd["x"] < w / 2]
-            right_half = [wd for wd in top_numbers if wd["x"] >= w / 2]
-            if left_half and right_half:
-                try:
-                    blue_score   = int(max(left_half,  key=lambda wd: wd["x"])["text"])
-                    orange_score = int(min(right_half, key=lambda wd: wd["x"])["text"])
-                except ValueError:
-                    blue_score = orange_score = None
-
-    # ── Запасной сигнал: баннер "ПОБЕДА"/"ПОРАЖЕНИЕ" ────────────────────
-    # Слово само по себе не говорит, ЧЬЯ это победа — это интерпретируется
-    # в _match_ocr_to_roster относительно того, кто прислал скриншот (он
-    # точно один из игроков этого матча).
-    result_word = None
-    for wd in words:
-        t = wd["text"].upper()
-        if "ПОБЕД" in t:
-            result_word = "victory"
-            break
-        if "ПОРАЖЕН" in t:
-            result_word = "defeat"
-            break
-
-    return {
-        "rows": rows,
-        "blue_score": blue_score,
-        "orange_score": orange_score,
-        "result_word": result_word,
-    }
-
-
-def _match_ocr_to_roster(m: dict, ocr: dict, reporter_uid: Optional[int] = None,
-                          prior_kd_by_uid: Optional[Dict[int, tuple]] = None,
-                          prior_side_win: Optional[str] = None) -> tuple:
-    """
-    Сопоставляет распознанные строки (по external_id) с реальными игроками
-    матча m (ct/t списки uid). Возвращает (kd_by_uid, side_win, unmatched, missing).
-      kd_by_uid  — {uid: (kills, deaths)} — НАКОПЛЕННЫЙ результат: если матчу
-                   уже присылали скрин раньше (prior_kd_by_uid), новые строки
-                   ДОПОЛНЯЮТ его, а не затирают целиком. Это нужно потому что
-                   разные игроки часто шлют разные скрины (каждый видит крупно
-                   свою половину экрана) — из них двух вместе может получиться
-                   полный ростер, даже если ни один скрин по отдельности не
-                   содержал всех.
-      side_win   — "ct"/"t"/None (None — не смогли определить победителя).
-                   Если новый скрин не даёт счёта, используется prior_side_win.
-      unmatched  — распознанные строки, чей external_id не принадлежит ни одному
-                   игроку этого матча (мусор/OCR-ошибка)
-      missing    — реальные игроки матча, для которых ДО СИХ ПОР нет строки
-                   ни на одном присланном скрине
-    """
-    all_uids = [u for u in (m.get("ct", []) + m.get("t", [])) if not _is_bot_uid(u)]
-    ext_to_uid = {}
-    for uid in all_uids:
-        p = get_player(uid)
-        if p.external_id:
-            ext_to_uid[str(p.external_id)] = uid
-
-    kd_by_uid: Dict[int, tuple] = dict(prior_kd_by_uid or {})
-    unmatched: List[str] = []
-    matched_uids = set(kd_by_uid.keys())
-    row_team_of_uid: Dict[int, str] = {}
-
-    for row in ocr["rows"]:
-        gid = row["external_id"]
-        uid = ext_to_uid.get(gid)
-        if uid is None:
-            unmatched.append(f"{row.get('nickname') or '?'} [ID {gid}]")
-            continue
-        kd_by_uid[uid] = (row["kills"], row["deaths"])
-        matched_uids.add(uid)
-        row_team_of_uid[uid] = row["team"]
-
-    missing = [get_player(u).nickname for u in all_uids if u not in matched_uids]
-
-    # ── Определяем победившую сторону ────────────────────────────────
-    winning_color = None
-    if ocr.get("blue_score") is not None and ocr.get("orange_score") is not None:
-        winning_color = "blue" if ocr["blue_score"] > ocr["orange_score"] else (
-            "orange" if ocr["orange_score"] > ocr["blue_score"] else None
-        )
-
-    if winning_color is None and ocr.get("result_word") and reporter_uid is not None:
-        reporter_color = row_team_of_uid.get(reporter_uid)
-        if reporter_color in ("blue", "orange"):
-            other_color = "orange" if reporter_color == "blue" else "blue"
-            if ocr["result_word"] == "victory":
-                winning_color = reporter_color
-            elif ocr["result_word"] == "defeat":
-                winning_color = other_color
-
-    side_win = None
-    if winning_color:
-            # Какая физическая сторона (ct/t в базе) соответствует этому цвету?
-            # Смотрим, к какой db-стороне принадлежит большинство игроков с этим цветом.
-            ct_set = set(m.get("ct", []))
-            color_uids = [u for u, c in row_team_of_uid.items() if c == winning_color]
-            if color_uids:
-                ct_hits = sum(1 for u in color_uids if u in ct_set)
-                side_win = "ct" if ct_hits >= len(color_uids) / 2 else "t"
-
-    if side_win is None:
-        side_win = prior_side_win
-
-    return kd_by_uid, side_win, unmatched, missing
-
-
-def _fill_missing_players_as_losers(m: dict, kd_by_uid: Dict[int, tuple], side_win: Optional[str]) -> List[str]:
-    """
-    Для игроков матча, которых бот НИ РАЗУ не нашёл ни на одном присланном
-    скрине (не зашёл в катку, вылетел, скрин не поймал его строку и т.п.) —
-    автоматически проставляет им 0 убийств / 8 смертей и засчитывает их в
-    ПРОИГРАВШУЮ сторону. Это соответствует логике «отсутствие результата —
-    это не сыгранный раунд», а не техническая победа отсутствующего игрока.
-    Возвращает список ников, которых пришлось доставить таким образом
-    (используется в тексте карточки подтверждения, чтобы админ это видел).
-    """
-    if side_win not in ("ct", "t"):
-        return []
-    losing_side = "t" if side_win == "ct" else "ct"
-    losing_uids = [u for u in m.get(losing_side, []) if not _is_bot_uid(u)]
-
-    filled: List[str] = []
-    for uid in losing_uids:
-        if uid not in kd_by_uid:
-            kd_by_uid[uid] = (0, 8)
-            filled.append(get_player(uid).nickname)
-
-    # Игроков победившей стороны без строки НЕ автозаполняем нулём — если
-    # команда выиграла, но бот не нашёл кого-то из победителей на скринах,
-    # это обычно ошибка распознавания ника/ID, а не реальный 0/0 победителя.
-    # Такие случаи остаются в missing и уходят на ручную проверку админом.
-    return filled
-
-
-def _build_win_template(m_id: str, m: dict, side: str) -> str:
-    """
-    Строит готовый шаблон команды /win для матча m_id с уже подставленными
-    game ID и никами всех игроков — админу остаётся только вписать реальные
-    цифры убийств/смертей вместо нулей и отправить сообщение как есть.
-    Это не заменяет OCR, а даёт быстрый путь ручного ввода: не нужно
-    вспоминать/искать game ID каждого игрока и печатать структуру команды
-    с нуля — только скопировать шаблон и подправить числа.
-    """
-    ct_uids = [u for u in m.get("ct", []) if not _is_bot_uid(u)]
-    t_uids  = [u for u in m.get("t", [])  if not _is_bot_uid(u)]
-
-    ct_won_mark = " 🏆" if side == "ct" else ""
-    t_won_mark  = " 🏆" if side == "t"  else ""
-
-    lines = [f"/win {m_id} {side}", ""]
-    lines.append(f"КТ:{ct_won_mark}")
-    for u in ct_uids:
-        p = get_player(u)
-        lines.append(f"ID {p.external_id or '?'} — 0 убийств — 0 смертей. // {p.nickname}")
-    lines.append("")
-    lines.append(f"Т:{t_won_mark}")
-    for u in t_uids:
-        p = get_player(u)
-        lines.append(f"ID {p.external_id or '?'} — 0 убийств — 0 смертей. // {p.nickname}")
-
-    return "\n".join(lines)
-
-
-def _win_template_buttons(m_id: str) -> InlineKeyboardMarkup:
-    """Кнопки быстрого шаблона /win под карточкой нераспознанного скрина."""
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("🔵 Победили CT", callback_data=f"wintpl_ct:{m_id}"),
-        InlineKeyboardButton("🔴 Победили T",  callback_data=f"wintpl_t:{m_id}"),
-    ]])
-
-
-def _build_ocr_confirm_card(m_id: str, m: dict, pending: dict) -> tuple:
-    """
-    Строит (текст, клавиатура) карточки подтверждения распознанного
-    результата матча. Используется и в общем чате, и в ЛС игроку/админу —
-    чтобы карточка выглядела одинаково независимо от источника скрина.
-    """
-    side_win = pending["side"]
-    kd_by_uid = {int(k): tuple(v) for k, v in pending["kd_by_uid"].items()}
-    reporter_uid = pending.get("reported_by")
-    filled_auto = set(pending.get("filled_auto", []))
-
-    win_label = "🔵 CT" if side_win == "ct" else "🔴 T"
-    lines = []
-    for u, (k, d) in kd_by_uid.items():
-        pl = get_player(u)
-        side_tag = "🏆" if (u in m.get(side_win, [])) else "❌"
-        auto_tag = " ⚠️<i>(не найден на скрине — авто 0/8)</i>" if pl.nickname in filled_auto else ""
-        lines.append(f"  {side_tag} {pl.nickname}: {k}/{d}{auto_tag}")
-
-    reporter_line = ""
-    if reporter_uid:
-        reporter_line = f"\n\nОт: {get_player(reporter_uid).tg_link()}"
-
-    screenshots_line = ""
-    n_shots = pending.get("screenshots_count", 1)
-    if n_shots > 1:
-        screenshots_line = f"\n📸 Собрано из {n_shots} присланных скринов."
-
-    text = (
-        f"🤖 <b>Матч #{m_id}</b> — распознанный результат по скрину:\n\n"
-        f"Победила сторона: {win_label}\n" + "\n".join(lines) +
-        reporter_line + screenshots_line +
-        f"\n\nПроверьте и подтвердите, либо введите вручную через /win."
-    )
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Подтвердить и применить", callback_data=f"ocrwin_confirm:{m_id}"),
-        InlineKeyboardButton("✏️ Ввести вручную",         callback_data=f"ocrwin_manual:{m_id}"),
-    ]])
-    return text, kb
-
-
 async def _process_result_screenshot(m_id: str, m: dict, uid: int, msg, context: ContextTypes.DEFAULT_TYPE, db: Dict[str, Any]):
     """
-    Общее ядро обработки присланного скрина результата: пробует распознать
-    итог через OCR и либо кладёт карточку подтверждения в pending_ocr
-    (плюс шлёт её в админ-конфу), либо просит администрацию проверить вручную.
-    Используется и при скрине в группе (по подписи с номером матча),
-    и при скрине, присланном игроком в ЛС боту.
+    Общее ядро обработки присланного скрина результата: без автоматического
+    распознавания — просто пересылает скрин в админ-конфу и просит
+    администрацию проверить его и ввести результат вручную командой /win.
+    Используется и при скрине в группе (по подписи с номером матча), и при
+    скрине, присланном игроком в ЛС боту.
     НЕ отвечает игроку — это делает вызывающий код (там разный текст).
-
-    Игроки часто присылают РАЗНЫЕ скрины одного и того же матча (в игре
-    видно крупно только свою половину экрана, а после матча — общий
-    финальный экран), поэтому результат НАКАПЛИВАЕТСЯ: если по матчу уже
-    приходил скрин раньше — новые распознанные строки достраивают прошлый
-    результат, а не затирают его. Как только сторона-победитель известна
-    (из счёта или баннера «ПОБЕДА»/«ПОРАЖЕНИЕ» на любом из скринов), а
-    кого-то из проигравшей стороны так и не нашли ни на одном скрине —
-    бот сам проставляет ему 0 убийств / 8 смертей, чтобы не блокировать
-    подтверждение результата из-за одного не зашедшего в катку игрока.
     """
     p = get_player(uid)
-    try:
-        ocr_result = None
-        unmatched: List[str] = []
-        missing: List[str] = []
-
-        prior = db.get("pending_ocr", {}).get(m_id)
-        prior_kd_by_uid: Dict[int, tuple] = {}
-        prior_side_win: Optional[str] = None
-        prior_shots = 0
-        if prior:
-            prior_kd_by_uid = {int(k): tuple(v) for k, v in prior.get("kd_by_uid", {}).items()}
-            prior_side_win  = prior.get("side")
-            prior_shots     = prior.get("screenshots_count", 1)
-
-        kd_by_uid: Dict[int, tuple] = dict(prior_kd_by_uid)
-        side_win = prior_side_win
-
+    if ADMIN_GROUP_ID:
         try:
-            photo_file = await msg.photo[-1].get_file()
-            photo_bytes = bytes(await photo_file.download_as_bytearray())
-            ocr_result = parse_scoreboard_ocr(photo_bytes)
-            if ocr_result:
-                kd_by_uid, side_win, unmatched, missing = _match_ocr_to_roster(
-                    m, ocr_result, reporter_uid=uid,
-                    prior_kd_by_uid=prior_kd_by_uid, prior_side_win=prior_side_win,
-                )
-            else:
-                # Этот конкретный скрин не распознался, но у нас уже могли
-                # быть накопленные данные от предыдущих скринов — считаем missing
-                # относительно них, а не сбрасываем всё в ноль.
-                all_uids = [u for u in (m.get("ct", []) + m.get("t", [])) if not _is_bot_uid(u)]
-                missing = [get_player(u).nickname for u in all_uids if u not in kd_by_uid]
-        except Exception as e:
-            print(f"[result] ocr error: {e!r}")
-            ocr_result = None
-
-        if ADMIN_GROUP_ID:
-            try:
-                await context.bot.forward_message(
-                    chat_id=ADMIN_GROUP_ID,
-                    from_chat_id=msg.chat_id,
-                    message_id=msg.message_id,
-                )
-            except Exception as e:
-                print(f"[result] admin forward error: {e!r}")
-
-        # ── Запоминаем сам скрин (чат+id исходного сообщения), чтобы позже
-        # можно было переслать его любому админу, который жмёт кнопку
-        # шаблона в ЛС — не только тому, кто сидит в админ-группе. ─────────
-        prior_shots_list = (prior or {}).get("screenshots", [])
-        shots_list = list(prior_shots_list) + [{
-            "chat_id":    msg.chat_id,
-            "message_id": msg.message_id,
-            "from_uid":   uid,
-            "ts":         time.time(),
-        }]
-
-        shots_count = prior_shots + 1
-
-        # ── Автодоставка отсутствующих игроков ──────────────────────────
-        # Победитель уже известен и остаётся кто-то без строки — считаем,
-        # что это игроки проигравшей стороны, которые не отыграли катку
-        # (не зашли/дисконнект), и проставляем им 0/8 автоматически.
-        filled_auto: List[str] = []
-        if side_win in ("ct", "t") and missing:
-            filled_auto = _fill_missing_players_as_losers(m, kd_by_uid, side_win)
-            all_uids = [u for u in (m.get("ct", []) + m.get("t", [])) if not _is_bot_uid(u)]
-            missing = [get_player(u).nickname for u in all_uids if u not in kd_by_uid]
-
-        ocr_ok = (bool(ocr_result) or bool(prior)) and side_win is not None and not unmatched and not missing and len(kd_by_uid) >= 2
-
-        if not ocr_ok:
-            reasons = []
-            if not _ocr_available():
-                if pytesseract is None:
-                    reasons.append("на сервере не установлен pytesseract/tesseract (проверь requirements.txt и Aptfile на Railway)")
-                else:
-                    reasons.append("на сервере не установлен русский языковой пакет tesseract-ocr-rus (добавь его в Aptfile и передеплой)")
-            elif not ocr_result and not prior:
-                reasons.append("не нашёл таблицу на скрине (плохой ракурс/качество/не тот интерфейс)")
-            else:
-                if side_win is None:
-                    reasons.append("не разобрал счёт команд")
-                if unmatched:
-                    reasons.append("есть нераспознанные/чужие ID: " + ", ".join(unmatched))
-                if missing:
-                    reasons.append("не нашёл строку для: " + ", ".join(missing))
-
-            # Сохраняем накопленный прогресс — если это не первый скрин по
-            # матчу, следующий присланный скрин (от другого игрока или того
-            # же) продолжит достраивать этот же результат, а не начнёт с нуля.
-            if kd_by_uid or side_win:
-                db.setdefault("pending_ocr", {})[m_id] = {
-                    "side":               side_win,
-                    "kd_by_uid":          {str(k): list(v) for k, v in kd_by_uid.items()},
-                    "reported_by":        uid,
-                    "screenshots_count":  shots_count,
-                    "screenshots":        shots_list,
-                    "filled_auto":        filled_auto,
-                }
-
-            # Помечаем матч как «есть скрин, но не распознан полностью» —
-            # это увидит любой админ/мод через кнопку «🧾 Результаты матчей»
-            # в ЛС, даже если он не сидит в админ-конфе.
-            db.setdefault("unresolved_results", {})[m_id] = {
-                "reported_by": uid,
-                "reasons":     reasons,
-                "ts":          time.time(),
-                "screenshots": shots_list,
-            }
-            save_db(db)
-
-            progress_line = ""
-            if kd_by_uid:
-                progress_line = (
-                    f"\nУже есть данные по {len(kd_by_uid)} из "
-                    f"{len([u for u in (m.get('ct', []) + m.get('t', [])) if not _is_bot_uid(u)])} игроков "
-                    f"(из {shots_count} скрин(ов)) — ждём остальные скрины или ручной ввод."
-                )
-
-            if ADMIN_GROUP_ID:
-                await context.bot.send_message(
-                    chat_id=ADMIN_GROUP_ID,
-                    text=(
-                        f"📸 Скрин результатов матча #{m_id}\n"
-                        f"От: {p.tg_link()}\n\n"
-                        f"⚠️ Бот не смог уверенно распознать результат автоматически "
-                        f"({'; '.join(reasons) if reasons else 'неизвестная причина'})."
-                        f"{progress_line}\n"
-                        f"Нажмите кнопку ниже, чтобы получить готовый шаблон ввода с "
-                        f"подставленными ID игроков — останется вписать только цифры "
-                        f"убийств/смертей, либо дождитесь ещё одного скрина от другого "
-                        f"игрока матча."
-                    ),
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=_win_template_buttons(m_id),
-                )
-            return
-
-        # Успешно распознали — если раньше матч висел как «нераспознанный», убираем отметку
-        db.get("unresolved_results", {}).pop(m_id, None)
-
-        # ── Уверенно распознали — кладём в очередь на подтверждение админом ──
-        db.setdefault("pending_ocr", {})[m_id] = {
-            "side":               side_win,
-            "kd_by_uid":          {str(k): list(v) for k, v in kd_by_uid.items()},
-            "reported_by":        uid,
-            "screenshots_count":  shots_count,
-            "screenshots":        shots_list,
-            "filled_auto":        filled_auto,
-        }
-        save_db(db)
-
-        text, kb = _build_ocr_confirm_card(m_id, m, db["pending_ocr"][m_id])
-        if ADMIN_GROUP_ID:
-            await context.bot.send_message(
-                chat_id=ADMIN_GROUP_ID, text=text, parse_mode=ParseMode.HTML, reply_markup=kb,
+            await context.bot.forward_message(
+                chat_id=ADMIN_GROUP_ID,
+                from_chat_id=msg.chat_id,
+                message_id=msg.message_id,
             )
-    except Exception as e:
-        # Подстраховка: если где-то в блоке выше что-то пошло не так и
-        # не было поймано локально — не даём ошибке пройти полностью молча.
-        # Печатаем traceback в лог Railway И пытаемся всё равно уведомить
-        # админ-группу, чтобы результат не потерялся без следа.
-        import traceback
-        traceback.print_exc()
-        if ADMIN_GROUP_ID:
-            try:
-                await context.bot.send_message(
-                    chat_id=ADMIN_GROUP_ID,
-                    text=(
-                        f"⚠️ Ошибка при обработке скрина матча #{m_id}: <code>{e!r}</code>\n"
-                        f"Проверьте вручную и введите <code>/win {m_id} ct|t ...</code>."
-                    ),
-                    parse_mode=ParseMode.HTML,
-                )
-            except Exception as e2:
-                print(f"[result] даже фолбэк-уведомление не отправилось: {e2!r}")
+            await context.bot.send_message(
+                chat_id=ADMIN_GROUP_ID,
+                text=(
+                    f"📸 Скрин результатов матча #{m_id}\n"
+                    f"От: {p.tg_link()}\n\n"
+                    f"Проверьте вручную и введите результат командой:\n"
+                    f"<code>/win {m_id} ct|t ...</code>"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:
+            print(f"[result] admin notify error: {e!r}")
+
 
 
 async def scoreboard_photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5553,6 +4751,366 @@ async def unban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
+# ════════════════════════════════════════════════
+#         АДМИН-ПАНЕЛЬ (только в ЛС, кнопками)
+# ════════════════════════════════════════════════
+# Пошаговый визард выдачи/снятия наказаний по ID или никнейму игрока.
+# Каждый шаг — редактирование ОДНОГО и того же сообщения бота, а
+# сообщение админа с вводом сразу удаляется, поэтому в чате не остаётся
+# спама из промежуточных шагов. Наказание сохраняется в БД (db["banned"] /
+# db["muted"] + db["punishment_log"] для истории), нигде публично не
+# отображается — только уведомление в ЛС самому наказанному.
+
+def _ap_find_target(query: str) -> Optional[int]:
+    """Ищет игрока по ID (число) или никнейму (без учёта регистра, без @)."""
+    query = (query or "").strip().lstrip("@")
+    if not query:
+        return None
+    if query.lstrip("-").isdigit():
+        return int(query)
+    db = load_db()
+    q_low = query.lower()
+    exact, partial = None, None
+    for s_uid, d in db["players"].items():
+        nick = (d.get("nickname") or "").lower()
+        if not nick:
+            continue
+        if nick == q_low:
+            exact = int(s_uid)
+            break
+        if partial is None and q_low in nick:
+            partial = int(s_uid)
+    return exact if exact is not None else partial
+
+
+def _ap_state(context: ContextTypes.DEFAULT_TYPE) -> dict:
+    return context.user_data.setdefault("ap", {})
+
+
+def _ap_reset(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop("ap", None)
+
+
+def ap_main_kb(uid: int) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("🔨 Выдать наказание", callback_data="ap_punish")],
+        [InlineKeyboardButton("🧹 Снять наказание",  callback_data="ap_unpunish")],
+    ]
+    if is_admin(uid):
+        rows.append([
+            InlineKeyboardButton("📋 Матчи",    callback_data="ap_matches"),
+            InlineKeyboardButton("🗑 Очередь",  callback_data="ap_clearqueue"),
+        ])
+    rows.append([InlineKeyboardButton("⬅️ В главное меню", callback_data="cmd_menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+AP_CANCEL_KB = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="ap_cancel")]])
+AP_BACK_KB   = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ В админ-панель", callback_data="ap_open")]])
+
+AP_COMMANDS_HINT = (
+    "\n\n<i>Прямо здесь же, в ЛС, работают и обычные команды:</i>\n"
+    "<code>/win /cancelwin /dropmatch /matches /clearqueue "
+    "/setelo /elo /rename /changeid /unreg</code>"
+)
+
+
+async def _ap_show_main(q, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _ap_reset(context)
+    text = "🛠 <b>Админ-панель</b>\n━━━━━━━━━━━━━━\nВыберите действие:" + AP_COMMANDS_HINT
+    await _menu_edit(q, text, ap_main_kb(q.from_user.id))
+
+
+async def _ap_ask_target(q, context: ContextTypes.DEFAULT_TYPE, mode: str) -> None:
+    st = _ap_state(context)
+    st.clear()
+    st["mode"]    = mode
+    st["step"]    = "target"
+    st["chat_id"] = q.message.chat_id
+    st["msg_id"]  = q.message.message_id
+    label = "выдачи наказания" if mode == "punish" else "снятия наказания"
+    await _menu_edit(
+        q,
+        f"🔎 Введите <b>ID</b> или <b>никнейм</b> игрока для {label}.\n"
+        f"Следующее сообщение удалится автоматически.",
+        AP_CANCEL_KB,
+    )
+
+
+async def ap_dm_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ловит текстовый ввод очередного шага админ-панели в ЛС. Если визард
+    не активен — не трогает сообщение (пропускает дальше по цепочке)."""
+    msg = update.message
+    if not msg or not msg.text:
+        return
+    uid = update.effective_user.id
+    st  = context.user_data.get("ap")
+    if not st or not is_moderator(uid):
+        return
+
+    step    = st.get("step")
+    chat_id = st.get("chat_id")
+    msg_id  = st.get("msg_id")
+
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+    async def _edit(text: str, kb: Optional[InlineKeyboardMarkup] = None):
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id, message_id=msg_id, text=text,
+                parse_mode=ParseMode.HTML, reply_markup=kb,
+            )
+        except Exception:
+            try:
+                sent = await context.bot.send_message(
+                    chat_id=chat_id, text=text, parse_mode=ParseMode.HTML, reply_markup=kb,
+                )
+                st["msg_id"] = sent.message_id
+            except Exception:
+                pass
+
+    if step == "target":
+        target = _ap_find_target(msg.text)
+        if target is None:
+            await _edit("❌ Игрок не найден. Введите ID или ник ещё раз:", AP_CANCEL_KB)
+            raise ApplicationHandlerStop()
+
+        if st.get("mode") == "punish" and is_admin(target):
+            _ap_reset(context)
+            await _edit("❌ Нельзя выдать наказание администратору.", AP_BACK_KB)
+            raise ApplicationHandlerStop()
+
+        p = get_player(target)
+        st["target"]   = target
+        st["nickname"] = p.nickname
+
+        if st.get("mode") == "punish":
+            st["step"] = "kind"
+            await _edit(
+                f"👤 <b>{p.nickname}</b> <code>[{target}]</code>\n\nВыберите тип наказания:",
+                InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔇 Мут", callback_data="ap_kind_mute"),
+                     InlineKeyboardButton("🚫 Бан", callback_data="ap_kind_ban")],
+                    [InlineKeyboardButton("👢 Кик", callback_data="ap_kind_kick")],
+                    [InlineKeyboardButton("❌ Отмена", callback_data="ap_cancel")],
+                ]),
+            )
+        else:
+            banned = check_banned(target)
+            muted  = check_muted(target)
+            if not banned and not muted:
+                _ap_reset(context)
+                await _edit(
+                    f"👤 <b>{p.nickname}</b> <code>[{target}]</code>\n\n✅ Активных наказаний нет.",
+                    AP_BACK_KB,
+                )
+                raise ApplicationHandlerStop()
+            rows = []
+            if banned:
+                rows.append([InlineKeyboardButton("✅ Снять бан", callback_data="ap_do_unban")])
+            if muted:
+                rows.append([InlineKeyboardButton("✅ Снять мут", callback_data="ap_do_unmute")])
+            rows.append([InlineKeyboardButton("❌ Отмена", callback_data="ap_cancel")])
+            status = " · ".join(s for s in (("🚫 В бане" if banned else None), ("🔇 В муте" if muted else None)) if s)
+            await _edit(
+                f"👤 <b>{p.nickname}</b> <code>[{target}]</code>\n\n{status}",
+                InlineKeyboardMarkup(rows),
+            )
+        raise ApplicationHandlerStop()
+
+    if step == "duration":
+        text = msg.text.strip().lower()
+        if st.get("kind") == "ban" and text in ("perm", "навсегда", "форевер"):
+            st["duration"]  = None
+            st["dur_label"] = "навсегда"
+        else:
+            dur = parse_duration(text)
+            if dur is None:
+                extra = " (или perm — вечный бан)" if st.get("kind") == "ban" else ""
+                await _edit(f"❌ Неверный формат. Примеры: 30m, 2h, 1d{extra}\nВведите срок ещё раз:", AP_CANCEL_KB)
+                raise ApplicationHandlerStop()
+            st["duration"]  = dur
+            st["dur_label"] = _fmt_duration(dur)
+        st["step"] = "reason"
+        await _edit("📌 Введите причину (или отправьте «-», если без причины):", AP_CANCEL_KB)
+        raise ApplicationHandlerStop()
+
+    if step == "reason":
+        reason = "" if msg.text.strip() == "-" else msg.text.strip()
+        st["reason"] = reason
+        st["step"]   = "confirm"
+        kind_label = {"ban": "🚫 Бан", "mute": "🔇 Мут", "kick": "👢 Кик"}[st["kind"]]
+        summary = (
+            f"❗️ <b>Подтвердите наказание</b>\n━━━━━━━━━━━━━━\n"
+            f"👤 Игрок: <b>{st['nickname']}</b> <code>[{st['target']}]</code>\n"
+            f"⚔️ Действие: {kind_label}\n"
+        )
+        if st["kind"] != "kick":
+            summary += f"⏳ Срок: <b>{st['dur_label']}</b>\n"
+        summary += f"📌 Причина: {reason or '—'}"
+        await _edit(
+            summary,
+            InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Подтвердить", callback_data="ap_confirm"),
+                InlineKeyboardButton("❌ Отмена",      callback_data="ap_cancel"),
+            ]]),
+        )
+        raise ApplicationHandlerStop()
+
+    raise ApplicationHandlerStop()
+
+
+async def _ap_callback(q, context: ContextTypes.DEFAULT_TYPE, cb: str) -> None:
+    """Обрабатывает все callback_data с префиксом ap_ (кнопки админ-панели)."""
+    uid = q.from_user.id
+    if not is_moderator(uid):
+        await q.answer("⛔ Недоступно.", show_alert=True)
+        return
+    await q.answer()
+
+    if cb == "ap_open":
+        await _ap_show_main(q, context); return
+
+    if cb == "ap_cancel":
+        _ap_reset(context)
+        await _menu_edit(q, "❌ Отменено.", AP_BACK_KB); return
+
+    if cb == "ap_punish":
+        await _ap_ask_target(q, context, "punish"); return
+
+    if cb == "ap_unpunish":
+        await _ap_ask_target(q, context, "unpunish"); return
+
+    if cb == "ap_matches":
+        if not is_admin(uid):
+            await _ap_show_main(q, context); return
+        db = load_db()
+        matches = db.get("active_matches", {})
+        if not matches:
+            text = "📋 Активных матчей нет."
+        else:
+            lines = [f"📋 <b>Активные матчи ({len(matches)})</b>"]
+            for m_id, m in matches.items():
+                ct_n = get_player(m["ct"][0]).nickname if m["ct"] else "?"
+                t_n  = get_player(m["t"][0]).nickname if m["t"] else "?"
+                lines.append(f"#{m_id} [{m.get('mode','?').upper()}] {ct_n} vs {t_n} | {m.get('phase','?')}")
+            text = "\n".join(lines)
+        await _menu_edit(q, text, AP_BACK_KB); return
+
+    if cb == "ap_clearqueue":
+        if not is_admin(uid):
+            await _ap_show_main(q, context); return
+        db = load_db()
+        for q_key in ("queue_5v5", "queue_2v2"):
+            for u in db.get(q_key, []):
+                if u < 0:
+                    db["players"].pop(str(u), None)
+            db[q_key] = []
+        save_db(db)
+        await _menu_edit(q, "🗑 Очередь очищена.", AP_BACK_KB); return
+
+    st = _ap_state(context)
+
+    if cb in ("ap_kind_mute", "ap_kind_ban", "ap_kind_kick"):
+        if not st.get("target"):
+            await _ap_show_main(q, context); return
+        st["kind"] = cb.rsplit("_", 1)[-1]
+        if st["kind"] == "kick":
+            st["step"] = "reason"
+            await _menu_edit(q, "📌 Введите причину (или «-»):", AP_CANCEL_KB)
+        else:
+            st["step"] = "duration"
+            extra = " Для вечного бана отправьте «perm».\n" if st["kind"] == "ban" else ""
+            await _menu_edit(q, f"⏳ Введите срок (пример: 30m, 2h, 1d).\n{extra}", AP_CANCEL_KB)
+        return
+
+    if cb in ("ap_do_unban", "ap_do_unmute"):
+        target = st.get("target")
+        if not target:
+            await _ap_show_main(q, context); return
+        db = load_db()
+        if cb == "ap_do_unban":
+            db["banned"].pop(str(target), None); save_db(db)
+            tg_err = await _tg_unban(context, BESEDA_CHAT_ID, target)
+            action_txt = "✅ Бан снят"
+        else:
+            db["muted"].pop(str(target), None); save_db(db)
+            tg_err = await _tg_unmute(context, BESEDA_CHAT_ID, target)
+            action_txt = "✅ Мут снят"
+        p = get_player(target)
+        text = f"{action_txt} с <b>{p.nickname}</b>."
+        if tg_err:
+            text += f"\n⚠️ Telegram: {tg_err}"
+        _ap_reset(context)
+        await _menu_edit(q, text, AP_BACK_KB); return
+
+    if cb == "ap_confirm":
+        target = st.get("target")
+        kind   = st.get("kind")
+        if not target or not kind:
+            await _ap_show_main(q, context); return
+
+        reason  = st.get("reason", "")
+        p       = get_player(target)
+        admin_p = get_player(uid)
+        db      = load_db()
+
+        if kind == "kick":
+            tg_err = await _tg_ban(context, BESEDA_CHAT_ID, target, until_date=None)
+            if not tg_err:
+                await _tg_unban(context, BESEDA_CHAT_ID, target)
+            text = f"👢 <b>{p.nickname}</b> кикнут из беседы."
+            if tg_err:
+                text += f"\n⚠️ Telegram: {tg_err}"
+
+        elif kind == "mute":
+            duration = st.get("duration")
+            until_ts = int(datetime.now().timestamp()) + duration
+            db.setdefault("muted", {})[str(target)] = until_ts
+            save_db(db)
+            asyncio.create_task(_schedule_mute_expiry(context.bot, target, float(until_ts)))
+            tg_err = await _tg_mute(context, BESEDA_CHAT_ID, target, until_date=until_ts)
+            text = f"🔇 <b>{p.nickname}</b> замьючен на {st['dur_label']}."
+            if tg_err:
+                text += f"\n⚠️ Telegram: {tg_err}"
+            if not _is_bot_uid(target):
+                await _notify_punishment_dm(context, target, "mute", st["dur_label"], reason)
+
+        else:  # ban
+            duration = st.get("duration")
+            if duration is None:
+                db.setdefault("banned", {})[str(target)] = 9_999_999_999
+                until_ts = None
+            else:
+                until_ts = int(datetime.now().timestamp()) + duration
+                db.setdefault("banned", {})[str(target)] = until_ts
+                asyncio.create_task(_schedule_ban_expiry(context.bot, target, float(until_ts)))
+            save_db(db)
+            tg_err = await _tg_ban(context, BESEDA_CHAT_ID, target, until_date=until_ts)
+            text = f"🚫 <b>{p.nickname}</b> забанен на {st['dur_label']}."
+            if tg_err:
+                text += f"\n⚠️ Telegram: {tg_err}"
+            if not _is_bot_uid(target):
+                await _notify_punishment_dm(context, target, "ban", st["dur_label"], reason)
+
+        # Служебный лог наказания в БД — нигде публично не показывается.
+        db = load_db()
+        db.setdefault("punishment_log", []).append({
+            "target": target, "nickname": p.nickname, "kind": kind,
+            "duration": st.get("duration"), "dur_label": st.get("dur_label", "—"),
+            "reason": reason, "by": uid, "by_nick": admin_p.nickname,
+            "ts": time.time(),
+        })
+        db["punishment_log"] = db["punishment_log"][-500:]
+        save_db(db)
+
+        _ap_reset(context)
+        await _menu_edit(q, text, AP_BACK_KB); return
+
+
 async def win_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /win <номер_матча> <ct|t>
@@ -5683,21 +5241,6 @@ async def win_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
-    # ── Если есть другие матчи, ожидающие подтверждения результата, —
-    # сразу подсказываем об этом админу, закрывшему катку.
-    remaining = db.get("pending_ocr", {})
-    if remaining:
-        try:
-            await context.bot.send_message(
-                chat_id=update.effective_user.id,
-                text=(
-                    f"🧾 Есть ещё {len(remaining)} матч(ей), ожидающих подтверждения результата.\n"
-                    f"Открой кнопку «🧾 Результаты матчей» в /start, чтобы их разобрать."
-                ),
-            )
-        except Exception:
-            pass
-
 
 async def cancelwin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -5767,7 +5310,7 @@ async def cancelwin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 delta = snap
             else:
                 platform      = pdata.get("platform", "pc")
-                win_d, loss_d = elo_deltas_for(platform)
+                win_d, loss_d = elo_deltas_for(platform, pdata.get("elo", CALIBRATION_BASE_ELO))
                 delta = win_d if won else loss_d
             for field in ("elo", f"elo_{mode}"):
                 old_val = pdata.get(field, 0)
@@ -6546,7 +6089,8 @@ async def api_match_history(request):
             # не хранят точную применённую дельту — считаем её по текущей
             # формуле начисления ELO, вместо того чтобы показывать +0 ELO.
             platform_fallback = players.get(str(tg_id), {}).get("platform", "pc")
-            win_d_fb, loss_d_fb = elo_deltas_for(platform_fallback)
+            elo_fallback = players.get(str(tg_id), {}).get("elo", CALIBRATION_BASE_ELO)
+            win_d_fb, loss_d_fb = elo_deltas_for(platform_fallback, elo_fallback)
             elo_delta = win_d_fb if won else -loss_d_fb
         rows.append({
             "match_id":    m_id,
@@ -6765,6 +6309,13 @@ async def run_bot():
     # (только групповые чаты — личка сюда не попадает, см. ChatType.GROUPS).
     app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.GROUPS, scoreboard_photo_handler))
     app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.GROUPS, message_filter_handler))
+
+    # Пошаговый ввод в админ-панели (ID/ник, срок, причина) — должен
+    # перехватываться раньше вообще всего остального в ЛС.
+    app.add_handler(MessageHandler(
+        filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND,
+        ap_dm_text_handler,
+    ), group=-2)
 
     # Обработчик кнопочной регистрации в ЛС: ловит "ID Никнейм" после выбора
     # платформы, до того как сообщение попадёт в транслятор тикетов.
